@@ -1,0 +1,6 @@
+[submodule "test/cpp-httplib"]
+	path = test/cpp-httplib
+	url = https://github.com/yhirose/cpp-httplib
+[submodule "test/IXWebSocket"]
+	path = test/IXWebSocket
+	url = https://github.com/machinezone/IXWebSocket
