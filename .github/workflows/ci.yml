@@ -56,13 +56,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Resolve Python executable for CMake
+        shell: bash
+        run: echo "PYTHON_FOR_CMAKE=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+
       - name: Install Python deps for mbedTLS codegen
         if: matrix.fetch_mbedtls == 'ON'
-        run: python -m pip install --upgrade pip jsonschema
+        run: ${{ env.PYTHON_FOR_CMAKE }} -m pip install --upgrade pip jsonschema
 
       - name: Configure
         run: >-
           cmake -S . -B build
+          -DPython3_EXECUTABLE=${{ env.PYTHON_FOR_CMAKE }}
           -DNATIVE_TLS_SHIM_BACKEND=${{ matrix.backend }}
           -DNATIVE_TLS_SHIM_FETCH_MBEDTLS=${{ matrix.fetch_mbedtls }}
           -DNATIVE_TLS_SHIM_BUILD_TESTS=${{ matrix.build_tests }}
