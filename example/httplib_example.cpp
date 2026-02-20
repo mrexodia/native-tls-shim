@@ -3,8 +3,8 @@
 #include <iostream>
 
 int main() {
-  httplib::SSLClient cli("httpbin.org", 443);
-  auto res = cli.Get("/ip");
+  httplib::Client cli("https://www.howsmyssl.com");
+  auto res = cli.Get("/a/check");
   if (!res) {
     std::cerr << "request failed\n";
     return 1;

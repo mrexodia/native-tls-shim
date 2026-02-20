@@ -13,7 +13,7 @@ set(HTTPLIB_TEST OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_INSTALL OFF CACHE BOOL "" FORCE)
 
 if(EXISTS "${_cpp_httplib_dir}/CMakeLists.txt")
-  add_subdirectory("${_cpp_httplib_dir}" "${CMAKE_CURRENT_BINARY_DIR}/cpp-httplib")
+  add_subdirectory("${_cpp_httplib_dir}" "${CMAKE_CURRENT_BINARY_DIR}/cpp-httplib" SYSTEM)
 else()
   FetchContent_Declare(
     cpp_httplib
@@ -34,7 +34,7 @@ set(OPENSSL_INCLUDE_DIR "${CMAKE_SOURCE_DIR}" CACHE PATH "" FORCE)
 set(OPENSSL_LIBRARIES "OpenSSL::SSL;OpenSSL::Crypto" CACHE STRING "" FORCE)
 
 if(EXISTS "${_ixws_dir}/CMakeLists.txt")
-  add_subdirectory("${_ixws_dir}" "${CMAKE_CURRENT_BINARY_DIR}/IXWebSocket")
+  add_subdirectory("${_ixws_dir}" "${CMAKE_CURRENT_BINARY_DIR}/IXWebSocket" SYSTEM)
 else()
   FetchContent_Declare(
     ixwebsocket
@@ -108,3 +108,7 @@ add_test(NAME test_ixwebsocket_server COMMAND test_ixwebsocket_server)
 add_test(NAME test_ixwebsocket_verify_disabled COMMAND test_ixwebsocket_verify_disabled)
 add_test(NAME test_ixhttp_tls_matrix COMMAND test_ixhttp_tls_matrix)
 add_test(NAME test_ixwebsocket_mtls COMMAND test_ixwebsocket_mtls)
+
+add_executable(debug_schannel_init debug_schannel_init.cpp)
+target_compile_definitions(debug_schannel_init PRIVATE NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(debug_schannel_init PRIVATE OpenSSL::SSL OpenSSL::Crypto)

@@ -34,14 +34,16 @@ if(_backend STREQUAL "AUTO")
   endif()
 endif()
 
+if(NOT (_backend STREQUAL "MBEDTLS" OR _backend STREQUAL "SCHANNEL" OR _backend STREQUAL "APPLE"))
+  message(FATAL_ERROR "Unsupported NATIVE_TLS_SHIM_BACKEND='${NATIVE_TLS_SHIM_BACKEND}'")
+endif()
+
 set(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND "${_backend}")
 
-if(_backend STREQUAL "SCHANNEL")
-  message(WARNING "Schannel backend is not implemented yet; building mbedTLS backend with Schannel placeholders.")
-  set(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND "MBEDTLS")
-elseif(_backend STREQUAL "APPLE")
-  message(WARNING "Apple Security backend is not implemented yet; building mbedTLS backend with Apple placeholders.")
-  set(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND "MBEDTLS")
+if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
+  message(STATUS "Schannel backend selected")
+elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "APPLE")
+  message(STATUS "Apple backend selected")
 endif()
 
 set(_mbedtls_targets)
@@ -72,12 +74,19 @@ if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS")
   endif()
 endif()
 
-add_library(native_tls_shim STATIC
+set(_native_tls_shim_sources
   src/tls_backend.cpp
-  src/tls_mbedtls.cpp
-  src/tls_schannel.cpp
-  src/tls_apple.cpp
 )
+
+if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS")
+  list(APPEND _native_tls_shim_sources src/tls_mbedtls.cpp)
+elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
+  list(APPEND _native_tls_shim_sources src/tls_schannel.cpp)
+elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "APPLE")
+  list(APPEND _native_tls_shim_sources src/tls_apple.cpp)
+endif()
+
+add_library(native_tls_shim STATIC ${_native_tls_shim_sources})
 
 add_library(native_tls_shim::native_tls_shim ALIAS native_tls_shim)
 
@@ -94,7 +103,10 @@ if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS")
 endif()
 
 if(WIN32)
-  target_link_libraries(native_tls_shim PRIVATE ws2_32)
+  target_link_libraries(native_tls_shim PRIVATE ws2_32 crypt32 bcrypt)
+  if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
+    target_link_libraries(native_tls_shim PRIVATE secur32 ncrypt)
+  endif()
 endif()
 
 target_compile_definitions(native_tls_shim
@@ -102,9 +114,9 @@ target_compile_definitions(native_tls_shim
     OPENSSL_VERSION_NUMBER=0x30000000L
 )
 
-if(_backend STREQUAL "SCHANNEL")
+if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
   target_compile_definitions(native_tls_shim PUBLIC NATIVE_TLS_SHIM_BACKEND_SCHANNEL)
-elseif(_backend STREQUAL "APPLE")
+elseif(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "APPLE")
   target_compile_definitions(native_tls_shim PUBLIC NATIVE_TLS_SHIM_BACKEND_APPLE)
 else()
   target_compile_definitions(native_tls_shim PUBLIC NATIVE_TLS_SHIM_BACKEND_MBEDTLS)

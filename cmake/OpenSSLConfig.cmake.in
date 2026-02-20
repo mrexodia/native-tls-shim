@@ -1,7 +1,9 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
-find_dependency(MbedTLS)
+if("@NATIVE_TLS_SHIM_EFFECTIVE_BACKEND@" STREQUAL "MBEDTLS")
+  find_dependency(MbedTLS)
+endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/NativeTLSShimTargets.cmake")
 

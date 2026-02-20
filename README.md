@@ -5,8 +5,8 @@ OpenSSL header shim for projects that expect `openssl/*` APIs (notably `cpp-http
 ## Status
 
 - ✅ OpenSSL-compatible header surface (`openssl/`)
-- ✅ mbedTLS-backed implementation (current functional backend)
-- 🚧 Schannel backend placeholders (`src/tls_schannel.*`)
+- ✅ mbedTLS-backed implementation
+- ✅ Schannel backend implementation on Windows (`src/tls_schannel.*`) with no mbedTLS dependency
 - 🚧 Apple Security backend placeholders (`src/tls_apple.*`)
 
 ## Build
@@ -16,10 +16,37 @@ cmake -S . -B build -DNATIVE_TLS_SHIM_BACKEND=MBEDTLS
 cmake --build build
 ```
 
+For Schannel backend build (no mbedTLS dependency):
+
+```bash
+cmake -S . -B build-schannel -DNATIVE_TLS_SHIM_BACKEND=SCHANNEL -DNATIVE_TLS_SHIM_FETCH_MBEDTLS=OFF
+cmake --build build-schannel
+```
+
 When this project is the **top-level** CMake project, tests/examples are
 enabled by default.
 When consumed via **FetchContent/add_subdirectory**, tests/examples/install
 rules are disabled by default to avoid target pollution.
+
+## Examples
+
+Built example targets include:
+
+- `httplib_example`
+- `httplib_https_server_example` (HTTPS server on `https://localhost:8443`)
+- `ixwebsocket_example` (WSS client; accepts args)
+- `ixwebsocket_wss_server_example` (WSS echo server on `wss://localhost:9450`)
+
+The server examples use pre-generated localhost certificates from
+`test/fixtures` (`trusted-server-crt.pem`, `trusted-server-key.pem`).
+
+`ixwebsocket_example` usage:
+
+```bash
+ixwebsocket_example [url] [ca_file] [message]
+# example against local WSS server:
+ixwebsocket_example wss://127.0.0.1:9450 test/fixtures/trusted-ca-crt.pem hello
+```
 
 ## FetchContent usage
 
