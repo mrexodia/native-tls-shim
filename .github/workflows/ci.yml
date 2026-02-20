@@ -62,7 +62,7 @@ jobs:
 
       - name: Install Python deps for mbedTLS codegen
         if: matrix.fetch_mbedtls == 'ON'
-        run: ${{ env.PYTHON_FOR_CMAKE }} -m pip install --upgrade pip jsonschema
+        run: ${{ env.PYTHON_FOR_CMAKE }} -m pip install --upgrade pip jsonschema jinja2
 
       - name: Configure
         run: >-
