@@ -369,7 +369,12 @@ int ssl_send_cb(void* ctx, const unsigned char* buf, size_t len) {
 #ifdef _WIN32
   int rc = send(fd, reinterpret_cast<const char*>(buf), static_cast<int>(len), 0);
 #else
-  int rc = static_cast<int>(::send(fd, buf, len, 0));
+#ifdef MSG_NOSIGNAL
+  int flags = MSG_NOSIGNAL;
+#else
+  int flags = 0;
+#endif
+  int rc = static_cast<int>(::send(fd, buf, len, flags));
 #endif
   if (rc < 0) {
 #ifdef _WIN32

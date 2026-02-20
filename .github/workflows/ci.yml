@@ -56,6 +56,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Python deps for mbedTLS codegen
+        if: matrix.fetch_mbedtls == 'ON'
+        run: python -m pip install --upgrade pip jsonschema
+
       - name: Configure
         run: >-
           cmake -S . -B build
