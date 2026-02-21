@@ -64,6 +64,12 @@ bool set_fd_nonblocking(int fd, bool on) {
   return fcntl(fd, F_SETFL, flags) == 0;
 }
 
+bool is_fd_nonblocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return false;
+  return (flags & O_NONBLOCK) != 0;
+}
+
 time_t timegm_utc(std::tm* tmv) { return timegm(tmv); }
 
 std::string trim(std::string s) {
@@ -774,9 +780,14 @@ OSStatus ssl_read_cb(SSLConnectionRef connection, void* data, size_t* len) {
   if (ssl->fd < 0) return errSSLInternal;
   if (*len == 0) return noErr;
 
-  ssize_t rc = recv(ssl->fd, data, *len, 0);
+  size_t requested = *len;
+  ssize_t rc = recv(ssl->fd, data, requested, 0);
   if (rc > 0) {
     *len = static_cast<size_t>(rc);
+    if (static_cast<size_t>(rc) < requested) {
+      ssl->io_want = SSL_ERROR_WANT_READ;
+      return errSSLWouldBlock;
+    }
     return noErr;
   }
   *len = 0;
@@ -785,6 +796,7 @@ OSStatus ssl_read_cb(SSLConnectionRef connection, void* data, size_t* len) {
     ssl->io_want = SSL_ERROR_WANT_READ;
     return errSSLWouldBlock;
   }
+  if (errno == ECONNRESET) return errSSLClosedAbort;
   ssl->io_want = SSL_ERROR_SYSCALL;
   return errSecIO;
 }
@@ -795,9 +807,14 @@ OSStatus ssl_write_cb(SSLConnectionRef connection, const void* data, size_t* len
   if (ssl->fd < 0) return errSSLInternal;
   if (*len == 0) return noErr;
 
-  ssize_t rc = send(ssl->fd, data, *len, 0);
+  size_t requested = *len;
+  ssize_t rc = send(ssl->fd, data, requested, 0);
   if (rc > 0) {
     *len = static_cast<size_t>(rc);
+    if (static_cast<size_t>(rc) < requested) {
+      ssl->io_want = SSL_ERROR_WANT_WRITE;
+      return errSSLWouldBlock;
+    }
     return noErr;
   }
   *len = 0;
@@ -806,6 +823,7 @@ OSStatus ssl_write_cb(SSLConnectionRef connection, const void* data, size_t* len
     ssl->io_want = SSL_ERROR_WANT_WRITE;
     return errSSLWouldBlock;
   }
+  if (errno == ECONNRESET) return errSSLClosedAbort;
   ssl->io_want = SSL_ERROR_SYSCALL;
   return errSecIO;
 }
@@ -824,19 +842,10 @@ SSLProtocol protocol_from_version(int version) {
 
 static std::vector<SSLCipherSuite> default_cipher_suites() {
   std::vector<SSLCipherSuite> ciphers;
-  ciphers.push_back(TLS_AES_256_GCM_SHA384);
-  ciphers.push_back(TLS_AES_128_GCM_SHA256);
-  ciphers.push_back(TLS_CHACHA20_POLY1305_SHA256);
-  ciphers.push_back(TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256);
-  ciphers.push_back(TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256);
   ciphers.push_back(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384);
   ciphers.push_back(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256);
   ciphers.push_back(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384);
   ciphers.push_back(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
-  ciphers.push_back(TLS_DHE_RSA_WITH_AES_256_GCM_SHA384);
-  ciphers.push_back(TLS_DHE_RSA_WITH_AES_128_GCM_SHA256);
-  ciphers.push_back(TLS_RSA_WITH_AES_256_GCM_SHA384);
-  ciphers.push_back(TLS_RSA_WITH_AES_128_GCM_SHA256);
   return ciphers;
 }
 
@@ -879,14 +888,34 @@ bool configure_ssl_instance(SSL* ssl) {
     return false;
   }
 
-  SSLSetIOFuncs(ssl->ssl, ssl_read_cb, ssl_write_cb);
-  SSLSetConnection(ssl->ssl, ssl);
-  SSLSetProtocolVersionMin(ssl->ssl, protocol_from_version(ssl->ctx->min_proto_version));
+  OSStatus st = SSLSetIOFuncs(ssl->ssl, ssl_read_cb, ssl_write_cb);
+  if (st != noErr) {
+    set_error_message("SSLSetIOFuncs failed: " + cferror_to_string(st));
+    return false;
+  }
+  st = SSLSetConnection(ssl->ssl, ssl);
+  if (st != noErr) {
+    set_error_message("SSLSetConnection failed: " + cferror_to_string(st));
+    return false;
+  }
+  st = SSLSetProtocolVersionMin(ssl->ssl, protocol_from_version(ssl->ctx->min_proto_version));
+  if (st != noErr) {
+    set_error_message("SSLSetProtocolVersionMin failed: " + cferror_to_string(st));
+    return false;
+  }
   SSLProtocol max_proto = kTLSProtocol12;
-  SSLSetProtocolVersionMax(ssl->ssl, max_proto);
+  st = SSLSetProtocolVersionMax(ssl->ssl, max_proto);
+  if (st != noErr) {
+    set_error_message("SSLSetProtocolVersionMax failed: " + cferror_to_string(st));
+    return false;
+  }
 
-  if (!ssl->hostname.empty()) {
-    SSLSetPeerDomainName(ssl->ssl, ssl->hostname.c_str(), ssl->hostname.size());
+  if (!ssl->hostname.empty() && !is_ip_literal(ssl->hostname)) {
+    st = SSLSetPeerDomainName(ssl->ssl, ssl->hostname.c_str(), ssl->hostname.size());
+    if (st != noErr) {
+      set_error_message("SSLSetPeerDomainName failed: " + cferror_to_string(st));
+      return false;
+    }
   }
 
   if (!ssl->ctx->alpn_protocols.empty()) {
@@ -934,10 +963,20 @@ bool configure_ssl_instance(SSL* ssl) {
 
   if (ssl->ctx->is_client) {
     if (need_manual_verify) {
-      SSLSetSessionOption(ssl->ssl, kSSLSessionOptionBreakOnServerAuth, true);
+      OSStatus opt_st = SSLSetSessionOption(ssl->ssl, kSSLSessionOptionBreakOnServerAuth, true);
+      if (opt_st != noErr) {
+        set_error_message("SSLSetSessionOption(BreakOnServerAuth) failed: " +
+                          cferror_to_string(opt_st));
+        return false;
+      }
     }
   } else if (verify_peer && need_manual_verify) {
-    SSLSetSessionOption(ssl->ssl, kSSLSessionOptionBreakOnClientAuth, true);
+    OSStatus opt_st = SSLSetSessionOption(ssl->ssl, kSSLSessionOptionBreakOnClientAuth, true);
+    if (opt_st != noErr) {
+      set_error_message("SSLSetSessionOption(BreakOnClientAuth) failed: " +
+                        cferror_to_string(opt_st));
+      return false;
+    }
   }
 
   if (!ssl->ctx->is_client) {
@@ -947,7 +986,11 @@ bool configure_ssl_instance(SSL* ssl) {
                  ? kAlwaysAuthenticate
                  : kTryAuthenticate;
     }
-    SSLSetClientSideAuthenticate(ssl->ssl, auth);
+    OSStatus auth_st = SSLSetClientSideAuthenticate(ssl->ssl, auth);
+    if (auth_st != noErr) {
+      set_error_message("SSLSetClientSideAuthenticate failed: " + cferror_to_string(auth_st));
+      return false;
+    }
   }
 
   if (ssl->ctx->own_cert && ssl->ctx->own_key) {
@@ -2038,18 +2081,6 @@ static std::string normalize_cipher_token(std::string token) {
 
 static bool add_cipher_from_token(const std::string& token,
                                   std::vector<SSLCipherSuite>& out) {
-  if (token == "TLS_AES_128_GCM_SHA256") {
-    out.push_back(TLS_AES_128_GCM_SHA256);
-    return true;
-  }
-  if (token == "TLS_AES_256_GCM_SHA384") {
-    out.push_back(TLS_AES_256_GCM_SHA384);
-    return true;
-  }
-  if (token == "TLS_CHACHA20_POLY1305_SHA256") {
-    out.push_back(TLS_CHACHA20_POLY1305_SHA256);
-    return true;
-  }
   if (token == "ECDHE-ECDSA-AES128-GCM-SHA256") {
     out.push_back(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256);
     return true;
@@ -2126,7 +2157,9 @@ static bool parse_cipher_list_string(const char* str,
   }
   flush();
 
-  if (ciphers.empty()) return false;
+  if (ciphers.empty()) {
+    return false;
+  }
   out = std::move(ciphers);
   return true;
 }
@@ -2371,7 +2404,7 @@ BIO* SSL_get_rbio(const SSL* ssl) { return ssl ? ssl->rbio : nullptr; }
 int SSL_set_tlsext_host_name(SSL* ssl, const char* name) {
   if (!ssl || !name) return 0;
   ssl->hostname = name;
-  if (ssl->ssl && ssl->ctx && ssl->ctx->is_client) {
+  if (ssl->ssl && ssl->ctx && ssl->ctx->is_client && !is_ip_literal(ssl->hostname)) {
     OSStatus st = SSLSetPeerDomainName(ssl->ssl, ssl->hostname.c_str(), ssl->hostname.size());
     if (st != noErr) {
       set_error_message("SSLSetPeerDomainName failed (" + std::to_string(st) + "): " +
@@ -2422,21 +2455,28 @@ int SSL_set_ecdh_auto(SSL* /*ssl*/, int /*onoff*/) { return 1; }
 static int ssl_do_handshake(SSL* ssl) {
   if (!ssl || !ssl->ssl_setup) return -1;
 
-  int fd = ssl->fd;
-  int old_flags = -1;
-  bool restore_nonblock = false;
-  if (fd >= 0) {
-    old_flags = fcntl(fd, F_GETFL);
-    if (old_flags != -1 && (old_flags & O_NONBLOCK)) {
-      restore_nonblock = true;
-      fcntl(fd, F_SETFL, old_flags & ~O_NONBLOCK);
+  struct NonBlockingGuard {
+    int fd = -1;
+    bool restore = false;
+    bool was_nonblocking = false;
+    explicit NonBlockingGuard(int fd_in) : fd(fd_in) {
+      if (fd < 0) return;
+      int flags = fcntl(fd, F_GETFL, 0);
+      if (flags >= 0 && (flags & O_NONBLOCK)) {
+        was_nonblocking = true;
+        if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0) {
+          restore = true;
+        }
+      }
     }
-  }
-  auto restore_flags = [&]() {
-    if (restore_nonblock && old_flags != -1) {
-      fcntl(fd, F_SETFL, old_flags);
+    ~NonBlockingGuard() {
+      if (!restore || fd < 0) return;
+      int flags = fcntl(fd, F_GETFL, 0);
+      if (flags >= 0) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+      }
     }
-  };
+  } nonblocking_guard(ssl->fd);
 
   auto effective_verify_mode = ssl->verify_mode ? ssl->verify_mode : ssl->ctx->verify_mode;
   bool require_cert = !ssl->ctx->is_client && (effective_verify_mode & SSL_VERIFY_FAIL_IF_NO_PEER_CERT);
@@ -2444,39 +2484,32 @@ static int ssl_do_handshake(SSL* ssl) {
   for (;;) {
     ssl->io_want = SSL_ERROR_NONE;
     OSStatus st = SSLHandshake(ssl->ssl);
-
     if (st == noErr) {
-      if (!post_handshake_verify(ssl, require_cert)) {
-        restore_flags();
-        return -1;
-      }
+      if (!post_handshake_verify(ssl, require_cert)) return -1;
       query_selected_alpn(ssl);
       ssl->handshake_done = true;
       ssl->last_error = SSL_ERROR_NONE;
       ssl->last_ret = 1;
-      restore_flags();
       return 1;
     }
 
     if (st == errSSLWouldBlock) {
+      if (!nonblocking_guard.was_nonblocking) {
+        continue;
+      }
       ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
       ssl->last_ret = -1;
-      restore_flags();
       return -1;
     }
 
     if (st == errSSLServerAuthCompleted || st == errSSLClientAuthCompleted) {
-      if (!post_handshake_verify(ssl, require_cert)) {
-        restore_flags();
-        return -1;
-      }
+      if (!post_handshake_verify(ssl, require_cert)) return -1;
       continue;
     }
 
     if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
       ssl->last_error = SSL_ERROR_ZERO_RETURN;
       ssl->last_ret = 0;
-      restore_flags();
       return 0;
     }
 
@@ -2484,7 +2517,6 @@ static int ssl_do_handshake(SSL* ssl) {
     ssl->last_ret = -1;
     set_error_message("SSLHandshake failed (" + std::to_string(st) + "): " +
                      cferror_to_string(st));
-    restore_flags();
     return -1;
   }
 }
@@ -2505,57 +2537,69 @@ int SSL_read(SSL* ssl, void* buf, int num) {
     return n;
   }
 
-  ssl->io_want = SSL_ERROR_NONE;
-  size_t processed = 0;
-  OSStatus st = SSLRead(ssl->ssl, buf, static_cast<size_t>(num), &processed);
-  if (st == noErr || (st == errSSLWouldBlock && processed > 0)) {
-    ssl->last_ret = static_cast<int>(processed);
-    ssl->last_error = SSL_ERROR_NONE;
-    return static_cast<int>(processed);
-  }
-  if (st == errSSLWouldBlock) {
+  bool blocking = ssl->fd >= 0 && !is_fd_nonblocking(ssl->fd);
+  for (;;) {
+    ssl->io_want = SSL_ERROR_NONE;
+    size_t processed = 0;
+    OSStatus st = SSLRead(ssl->ssl, buf, static_cast<size_t>(num), &processed);
+    if (st == noErr || (st == errSSLWouldBlock && processed > 0)) {
+      ssl->last_ret = static_cast<int>(processed);
+      ssl->last_error = SSL_ERROR_NONE;
+      return static_cast<int>(processed);
+    }
+    if (st == errSSLWouldBlock) {
+      if (blocking) {
+        continue;
+      }
+      ssl->last_ret = -1;
+      ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
+      return -1;
+    }
+    if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+      ssl->last_ret = 0;
+      ssl->last_error = SSL_ERROR_ZERO_RETURN;
+      return 0;
+    }
+
     ssl->last_ret = -1;
-    ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
+    ssl->last_error = SSL_ERROR_SSL;
+    set_error_message("SSL_read failed: " + cferror_to_string(st));
     return -1;
   }
-  if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
-    ssl->last_ret = 0;
-    ssl->last_error = SSL_ERROR_ZERO_RETURN;
-    return 0;
-  }
-
-  ssl->last_ret = -1;
-  ssl->last_error = SSL_ERROR_SSL;
-  set_error_message("SSL_read failed: " + cferror_to_string(st));
-  return -1;
 }
 
 int SSL_write(SSL* ssl, const void* buf, int num) {
   if (!ssl || !buf || num <= 0) return -1;
 
-  ssl->io_want = SSL_ERROR_NONE;
-  size_t processed = 0;
-  OSStatus st = SSLWrite(ssl->ssl, buf, static_cast<size_t>(num), &processed);
-  if (st == noErr || (st == errSSLWouldBlock && processed > 0)) {
-    ssl->last_ret = static_cast<int>(processed);
-    ssl->last_error = SSL_ERROR_NONE;
-    return static_cast<int>(processed);
-  }
-  if (st == errSSLWouldBlock) {
+  bool blocking = ssl->fd >= 0 && !is_fd_nonblocking(ssl->fd);
+  for (;;) {
+    ssl->io_want = SSL_ERROR_NONE;
+    size_t processed = 0;
+    OSStatus st = SSLWrite(ssl->ssl, buf, static_cast<size_t>(num), &processed);
+    if (st == noErr || (st == errSSLWouldBlock && processed > 0)) {
+      ssl->last_ret = static_cast<int>(processed);
+      ssl->last_error = SSL_ERROR_NONE;
+      return static_cast<int>(processed);
+    }
+    if (st == errSSLWouldBlock) {
+      if (blocking) {
+        continue;
+      }
+      ssl->last_ret = -1;
+      ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_WRITE;
+      return -1;
+    }
+    if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+      ssl->last_ret = 0;
+      ssl->last_error = SSL_ERROR_ZERO_RETURN;
+      return 0;
+    }
+
     ssl->last_ret = -1;
-    ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_WRITE;
+    ssl->last_error = SSL_ERROR_SSL;
+    set_error_message("SSL_write failed: " + cferror_to_string(st));
     return -1;
   }
-  if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
-    ssl->last_ret = 0;
-    ssl->last_error = SSL_ERROR_ZERO_RETURN;
-    return 0;
-  }
-
-  ssl->last_ret = -1;
-  ssl->last_error = SSL_ERROR_SSL;
-  set_error_message("SSL_write failed: " + cferror_to_string(st));
-  return -1;
 }
 
 int SSL_peek(SSL* ssl, void* buf, int num) {
@@ -2563,24 +2607,31 @@ int SSL_peek(SSL* ssl, void* buf, int num) {
 
   if (ssl->peeked_plaintext.empty()) {
     std::vector<unsigned char> tmp(static_cast<size_t>(num));
-    ssl->io_want = SSL_ERROR_NONE;
-    size_t processed = 0;
-    OSStatus st = SSLRead(ssl->ssl, tmp.data(), tmp.size(), &processed);
-    if (st == noErr || (st == errSSLWouldBlock && processed > 0)) {
-      ssl->peeked_plaintext.assign(tmp.begin(), tmp.begin() + static_cast<long>(processed));
-    } else if (st == errSSLWouldBlock) {
-      ssl->last_ret = -1;
-      ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
-      return -1;
-    } else if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
-      ssl->last_ret = 0;
-      ssl->last_error = SSL_ERROR_ZERO_RETURN;
-      return 0;
-    } else {
-      ssl->last_ret = -1;
-      ssl->last_error = SSL_ERROR_SSL;
-      set_error_message("SSL_peek failed: " + cferror_to_string(st));
-      return -1;
+    bool blocking = ssl->fd >= 0 && !is_fd_nonblocking(ssl->fd);
+    for (;;) {
+      ssl->io_want = SSL_ERROR_NONE;
+      size_t processed = 0;
+      OSStatus st = SSLRead(ssl->ssl, tmp.data(), tmp.size(), &processed);
+      if (st == noErr || (st == errSSLWouldBlock && processed > 0)) {
+        ssl->peeked_plaintext.assign(tmp.begin(), tmp.begin() + static_cast<long>(processed));
+        break;
+      } else if (st == errSSLWouldBlock) {
+        if (blocking) {
+          continue;
+        }
+        ssl->last_ret = -1;
+        ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
+        return -1;
+      } else if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+        ssl->last_ret = 0;
+        ssl->last_error = SSL_ERROR_ZERO_RETURN;
+        return 0;
+      } else {
+        ssl->last_ret = -1;
+        ssl->last_error = SSL_ERROR_SSL;
+        set_error_message("SSL_peek failed: " + cferror_to_string(st));
+        return -1;
+      }
     }
   }
 
