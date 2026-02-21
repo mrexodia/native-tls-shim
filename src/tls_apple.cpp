@@ -11,6 +11,7 @@
 
 #include <Security/Security.h>
 #include <Security/SecureTransport.h>
+#include <Security/CipherSuite.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CommonCrypto/CommonDigest.h>
 
@@ -28,6 +29,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -350,6 +352,9 @@ struct ssl_ctx_st {
   std::string keychain_path;
 
   std::vector<std::string> alpn_protocols;
+
+  std::vector<SSLCipherSuite> cipher_suites;
+  bool cipher_suites_set = false;
 
   bool use_system_roots = false;
 
@@ -817,6 +822,46 @@ SSLProtocol protocol_from_version(int version) {
   }
 }
 
+static std::vector<SSLCipherSuite> default_cipher_suites() {
+  std::vector<SSLCipherSuite> ciphers;
+  ciphers.push_back(TLS_AES_256_GCM_SHA384);
+  ciphers.push_back(TLS_AES_128_GCM_SHA256);
+  ciphers.push_back(TLS_CHACHA20_POLY1305_SHA256);
+  ciphers.push_back(TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256);
+  ciphers.push_back(TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256);
+  ciphers.push_back(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384);
+  ciphers.push_back(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256);
+  ciphers.push_back(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384);
+  ciphers.push_back(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
+  ciphers.push_back(TLS_DHE_RSA_WITH_AES_256_GCM_SHA384);
+  ciphers.push_back(TLS_DHE_RSA_WITH_AES_128_GCM_SHA256);
+  ciphers.push_back(TLS_RSA_WITH_AES_256_GCM_SHA384);
+  ciphers.push_back(TLS_RSA_WITH_AES_128_GCM_SHA256);
+  return ciphers;
+}
+
+static std::vector<SSLCipherSuite> filter_supported_ciphers(
+    SSLContextRef ctx, const std::vector<SSLCipherSuite>& desired) {
+  if (!ctx || desired.empty()) return {};
+  size_t count = 0;
+  if (SSLGetNumberSupportedCiphers(ctx, &count) != noErr || count == 0) return {};
+  std::vector<SSLCipherSuite> supported(count);
+  if (SSLGetSupportedCiphers(ctx, supported.data(), &count) != noErr || count == 0) return {};
+  supported.resize(count);
+
+  std::unordered_set<SSLCipherSuite> supported_set(supported.begin(), supported.end());
+  std::unordered_set<SSLCipherSuite> added;
+  std::vector<SSLCipherSuite> out;
+  out.reserve(desired.size());
+  for (auto cipher : desired) {
+    if (supported_set.count(cipher) && !added.count(cipher)) {
+      out.push_back(cipher);
+      added.insert(cipher);
+    }
+  }
+  return out;
+}
+
 bool apply_trusted_roots(SSL* /*ssl*/) {
   return true;
 }
@@ -860,6 +905,23 @@ bool configure_ssl_instance(SSL* ssl) {
       }
       SSLSetALPNProtocols(ssl->ssl, protos);
       CFRelease(protos);
+    }
+  }
+
+  std::vector<SSLCipherSuite> desired_ciphers =
+      ssl->ctx->cipher_suites_set ? ssl->ctx->cipher_suites : default_cipher_suites();
+  if (!desired_ciphers.empty()) {
+    auto enabled_ciphers = filter_supported_ciphers(ssl->ssl, desired_ciphers);
+    if (!enabled_ciphers.empty()) {
+      OSStatus st = SSLSetEnabledCiphers(ssl->ssl, enabled_ciphers.data(),
+                                         static_cast<size_t>(enabled_ciphers.size()));
+      if (st != noErr) {
+        set_error_message("SSLSetEnabledCiphers failed: " + cferror_to_string(st));
+        return false;
+      }
+    } else if (ssl->ctx->cipher_suites_set) {
+      set_error_message("No supported cipher suites available");
+      return false;
     }
   }
 
@@ -1966,9 +2028,124 @@ int SSL_CTX_set_session_cache_mode(SSL_CTX* ctx, int mode) {
   return mode;
 }
 
-int SSL_CTX_set_cipher_list(SSL_CTX* /*ctx*/, const char* /*str*/) { return 1; }
+static std::string normalize_cipher_token(std::string token) {
+  token = trim(token);
+  for (auto& c : token) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return token;
+}
 
-int SSL_CTX_set_ciphersuites(SSL_CTX* /*ctx*/, const char* /*str*/) { return 1; }
+static bool add_cipher_from_token(const std::string& token,
+                                  std::vector<SSLCipherSuite>& out) {
+  if (token == "TLS_AES_128_GCM_SHA256") {
+    out.push_back(TLS_AES_128_GCM_SHA256);
+    return true;
+  }
+  if (token == "TLS_AES_256_GCM_SHA384") {
+    out.push_back(TLS_AES_256_GCM_SHA384);
+    return true;
+  }
+  if (token == "TLS_CHACHA20_POLY1305_SHA256") {
+    out.push_back(TLS_CHACHA20_POLY1305_SHA256);
+    return true;
+  }
+  if (token == "ECDHE-ECDSA-AES128-GCM-SHA256") {
+    out.push_back(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256);
+    return true;
+  }
+  if (token == "ECDHE-ECDSA-AES256-GCM-SHA384") {
+    out.push_back(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384);
+    return true;
+  }
+  if (token == "ECDHE-RSA-AES128-GCM-SHA256") {
+    out.push_back(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
+    return true;
+  }
+  if (token == "ECDHE-RSA-AES256-GCM-SHA384") {
+    out.push_back(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384);
+    return true;
+  }
+  if (token == "DHE-RSA-AES128-GCM-SHA256") {
+    out.push_back(TLS_DHE_RSA_WITH_AES_128_GCM_SHA256);
+    return true;
+  }
+  if (token == "DHE-RSA-AES256-GCM-SHA384") {
+    out.push_back(TLS_DHE_RSA_WITH_AES_256_GCM_SHA384);
+    return true;
+  }
+  if (token == "AES128-GCM-SHA256") {
+    out.push_back(TLS_RSA_WITH_AES_128_GCM_SHA256);
+    return true;
+  }
+  if (token == "AES256-GCM-SHA384") {
+    out.push_back(TLS_RSA_WITH_AES_256_GCM_SHA384);
+    return true;
+  }
+  if (token == "ECDHE-ECDSA-CHACHA20-POLY1305" ||
+      token == "ECDHE-ECDSA-CHACHA20-POLY1305-SHA256") {
+    out.push_back(TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256);
+    return true;
+  }
+  if (token == "ECDHE-RSA-CHACHA20-POLY1305" ||
+      token == "ECDHE-RSA-CHACHA20-POLY1305-SHA256") {
+    out.push_back(TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256);
+    return true;
+  }
+  return false;
+}
+
+static bool parse_cipher_list_string(const char* str,
+                                     std::vector<SSLCipherSuite>& out) {
+  if (!str) return false;
+  std::string input(str);
+  if (input.empty()) return false;
+
+  std::vector<SSLCipherSuite> ciphers;
+  std::string token;
+  auto flush = [&]() {
+    if (token.empty()) return;
+    std::string normalized = normalize_cipher_token(token);
+    token.clear();
+    if (normalized.empty()) return;
+    if (normalized[0] == '!') return;
+    if (normalized == "DEFAULT" || normalized == "HIGH" || normalized == "SECURE") {
+      auto defaults = default_cipher_suites();
+      ciphers.insert(ciphers.end(), defaults.begin(), defaults.end());
+      return;
+    }
+    add_cipher_from_token(normalized, ciphers);
+  };
+
+  for (char ch : input) {
+    if (ch == ':' || ch == ',' || ch == ';' || std::isspace(static_cast<unsigned char>(ch))) {
+      flush();
+    } else {
+      token.push_back(ch);
+    }
+  }
+  flush();
+
+  if (ciphers.empty()) return false;
+  out = std::move(ciphers);
+  return true;
+}
+
+int SSL_CTX_set_cipher_list(SSL_CTX* ctx, const char* str) {
+  if (!ctx || !str) return 0;
+  std::vector<SSLCipherSuite> parsed;
+  if (!parse_cipher_list_string(str, parsed)) {
+    set_error_message("SSL_CTX_set_cipher_list: no matching cipher suites");
+    return 0;
+  }
+  ctx->cipher_suites = std::move(parsed);
+  ctx->cipher_suites_set = true;
+  return 1;
+}
+
+int SSL_CTX_set_ciphersuites(SSL_CTX* ctx, const char* str) {
+  return SSL_CTX_set_cipher_list(ctx, str);
+}
 
 int SSL_CTX_load_verify_locations(SSL_CTX* ctx, const char* ca_file, const char* ca_path) {
   if (!ctx || !ctx->cert_store) return 0;
