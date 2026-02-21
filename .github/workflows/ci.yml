@@ -71,5 +71,10 @@ jobs:
         run: >-
           ctest --test-dir build -C Debug --output-on-failure
 
+      - name: Httplib cipher suite check (Windows)
+        if: runner.os == 'Windows'
+        run: ./build/example/Debug/httplib_example.exe
+
       - name: Httplib cipher suite check
+        if: runner.os != 'Windows'
         run: ./build/example/httplib_example
