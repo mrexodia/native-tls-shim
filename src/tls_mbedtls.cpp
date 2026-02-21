@@ -1437,6 +1437,24 @@ static void append_default_ciphers(std::vector<int>& out) {
   }
 }
 
+static void append_default_tls13_ciphers(std::vector<int>& out) {
+#if defined(MBEDTLS_SSL_PROTO_TLS1_3)
+  const int* defaults = mbedtls_ssl_list_ciphersuites();
+  if (!defaults) return;
+  for (const int* p = defaults; *p != 0; ++p) {
+    const auto* info = mbedtls_ssl_ciphersuite_from_id(*p);
+    if (!info) continue;
+    const char* name = mbedtls_ssl_ciphersuite_get_name(info);
+    if (!name || std::strncmp(name, "TLS1-3-", 7) != 0) continue;
+    if (std::find(out.begin(), out.end(), *p) == out.end()) {
+      out.push_back(*p);
+    }
+  }
+#else
+  (void) out;
+#endif
+}
+
 static bool add_cipher_from_token(const std::string& token, std::vector<int>& out) {
   const char* mbedtls_name = nullptr;
   if (token == "ECDHE-ECDSA-AES128-GCM-SHA256") {
@@ -1511,6 +1529,8 @@ int SSL_CTX_set_cipher_list(SSL_CTX* ctx, const char* str) {
     set_error_message("SSL_CTX_set_cipher_list: no matching cipher suites");
     return 0;
   }
+
+  append_default_tls13_ciphers(parsed);
 
   parsed.push_back(0);
   ctx->ciphersuites = std::move(parsed);
@@ -1791,8 +1811,13 @@ int SSL_connect(SSL* ssl) {
     ssl->hostname = ssl->param.host;
   }
 
-  if (!ssl->hostname.empty() && !is_ip_literal(ssl->hostname)) {
-    mbedtls_ssl_set_hostname(&ssl->ssl, ssl->hostname.c_str());
+  if (!ssl->hostname.empty()) {
+    bool is_ip = is_ip_literal(ssl->hostname);
+    bool should_verify = (effective_verify_mode & SSL_VERIFY_PEER) != 0 ||
+                         (ssl->ctx && ssl->ctx->is_client && ctx_has_ca_store(ssl->ctx));
+    if (!is_ip || should_verify) {
+      mbedtls_ssl_set_hostname(&ssl->ssl, ssl->hostname.c_str());
+    }
   }
 
   ssl->ignore_verify_result = false;
