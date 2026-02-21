@@ -17,6 +17,7 @@
 #include <mbedtls/pem.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/ssl_ciphersuites.h>
 #include <mbedtls/version.h>
 #include <mbedtls/x509_crt.h>
 #if MBEDTLS_VERSION_MAJOR >= 3
@@ -126,19 +127,18 @@ std::string extract_dn_component(const std::string& dn, const std::string& key) 
 
 bool wildcard_match(const std::string& pattern, const std::string& host) {
   if (pattern == host) return true;
-  auto star = pattern.find('*');
-  if (star == std::string::npos) return false;
 
-  auto prefix = pattern.substr(0, star);
-  auto suffix = pattern.substr(star + 1);
-  if (host.size() < prefix.size() + suffix.size()) return false;
-  if (host.compare(0, prefix.size(), prefix) != 0) return false;
-  if (host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0)
-    return false;
+  if (pattern.size() < 3 || pattern[0] != '*' || pattern[1] != '.') return false;
+  if (pattern.find('*', 1) != std::string::npos) return false;
 
-  // Keep wildcard to single label.
-  auto middle = host.substr(prefix.size(), host.size() - prefix.size() - suffix.size());
-  return middle.find('.') == std::string::npos;
+  std::string suffix = pattern.substr(1); // ".example.com"
+  if (host.size() <= suffix.size()) return false;
+  if (host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
+
+  std::string left = host.substr(0, host.size() - suffix.size());
+  if (left.empty() || left.find('.') != std::string::npos) return false;
+
+  return true;
 }
 
 int map_mbedtls_to_ssl_error(int ret) {
@@ -290,6 +290,9 @@ struct ssl_ctx_st {
 
   std::vector<std::string> alpn_protocols;
   std::vector<const char*> alpn_protocol_ptrs;
+
+  std::vector<int> ciphersuites;
+  bool ciphersuites_set = false;
 
   mbedtls_entropy_context entropy;
   mbedtls_ctr_drbg_context ctr_drbg;
@@ -557,7 +560,11 @@ bool setup_ssl_context(SSL_CTX* ctx) {
   }
 
   mbedtls_ssl_conf_rng(&ctx->conf, mbedtls_ctr_drbg_random, &ctx->ctr_drbg);
+#ifdef MBEDTLS_SSL_VERSION_TLS1_3
+  mbedtls_ssl_conf_max_tls_version(&ctx->conf, MBEDTLS_SSL_VERSION_TLS1_3);
+#else
   mbedtls_ssl_conf_max_tls_version(&ctx->conf, MBEDTLS_SSL_VERSION_TLS1_2);
+#endif
   apply_ctx_verify_mode(ctx);
   apply_ctx_ca_store(ctx);
 
@@ -1384,9 +1391,107 @@ int SSL_CTX_set_session_cache_mode(SSL_CTX* ctx, int mode) {
   return mode;
 }
 
-int SSL_CTX_set_cipher_list(SSL_CTX* /*ctx*/, const char* /*str*/) { return 1; }
+static std::string normalize_cipher_token(std::string token) {
+  token = trim(token);
+  for (auto& c : token) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return token;
+}
 
-int SSL_CTX_set_ciphersuites(SSL_CTX* /*ctx*/, const char* /*str*/) { return 1; }
+static void append_default_ciphers(std::vector<int>& out) {
+  const int* defaults = mbedtls_ssl_list_ciphersuites();
+  if (!defaults) return;
+  for (const int* p = defaults; *p != 0; ++p) {
+    out.push_back(*p);
+  }
+}
+
+static bool add_cipher_from_token(const std::string& token, std::vector<int>& out) {
+  const char* mbedtls_name = nullptr;
+  if (token == "ECDHE-ECDSA-AES128-GCM-SHA256") {
+    mbedtls_name = "TLS-ECDHE-ECDSA-WITH-AES-128-GCM-SHA256";
+  } else if (token == "ECDHE-ECDSA-AES256-GCM-SHA384") {
+    mbedtls_name = "TLS-ECDHE-ECDSA-WITH-AES-256-GCM-SHA384";
+  } else if (token == "ECDHE-RSA-AES128-GCM-SHA256") {
+    mbedtls_name = "TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256";
+  } else if (token == "ECDHE-RSA-AES256-GCM-SHA384") {
+    mbedtls_name = "TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384";
+  } else if (token == "DHE-RSA-AES128-GCM-SHA256") {
+    mbedtls_name = "TLS-DHE-RSA-WITH-AES-128-GCM-SHA256";
+  } else if (token == "DHE-RSA-AES256-GCM-SHA384") {
+    mbedtls_name = "TLS-DHE-RSA-WITH-AES-256-GCM-SHA384";
+  } else if (token == "AES128-GCM-SHA256") {
+    mbedtls_name = "TLS-RSA-WITH-AES-128-GCM-SHA256";
+  } else if (token == "AES256-GCM-SHA384") {
+    mbedtls_name = "TLS-RSA-WITH-AES-256-GCM-SHA384";
+  } else if (token == "ECDHE-ECDSA-CHACHA20-POLY1305" ||
+             token == "ECDHE-ECDSA-CHACHA20-POLY1305-SHA256") {
+    mbedtls_name = "TLS-ECDHE-ECDSA-WITH-CHACHA20-POLY1305-SHA256";
+  } else if (token == "ECDHE-RSA-CHACHA20-POLY1305" ||
+             token == "ECDHE-RSA-CHACHA20-POLY1305-SHA256") {
+    mbedtls_name = "TLS-ECDHE-RSA-WITH-CHACHA20-POLY1305-SHA256";
+  }
+
+  if (!mbedtls_name) return false;
+  int id = mbedtls_ssl_get_ciphersuite_id(mbedtls_name);
+  if (id == 0) return false;
+  out.push_back(id);
+  return true;
+}
+
+static bool parse_cipher_list_string(const char* str, std::vector<int>& out) {
+  if (!str) return false;
+  std::string input(str);
+  if (input.empty()) return false;
+
+  std::vector<int> ciphers;
+  std::string token;
+  auto flush = [&]() {
+    if (token.empty()) return;
+    std::string normalized = normalize_cipher_token(token);
+    token.clear();
+    if (normalized.empty()) return;
+    if (normalized[0] == '!') return;
+    if (normalized == "DEFAULT" || normalized == "HIGH" || normalized == "SECURE") {
+      append_default_ciphers(ciphers);
+      return;
+    }
+    add_cipher_from_token(normalized, ciphers);
+  };
+
+  for (char ch : input) {
+    if (ch == ':' || ch == ',' || ch == ';' || std::isspace(static_cast<unsigned char>(ch))) {
+      flush();
+    } else {
+      token.push_back(ch);
+    }
+  }
+  flush();
+
+  if (ciphers.empty()) return false;
+  out = std::move(ciphers);
+  return true;
+}
+
+int SSL_CTX_set_cipher_list(SSL_CTX* ctx, const char* str) {
+  if (!ctx || !str) return 0;
+  std::vector<int> parsed;
+  if (!parse_cipher_list_string(str, parsed)) {
+    set_error_message("SSL_CTX_set_cipher_list: no matching cipher suites");
+    return 0;
+  }
+
+  parsed.push_back(0);
+  ctx->ciphersuites = std::move(parsed);
+  ctx->ciphersuites_set = true;
+  mbedtls_ssl_conf_ciphersuites(&ctx->conf, ctx->ciphersuites.data());
+  return 1;
+}
+
+int SSL_CTX_set_ciphersuites(SSL_CTX* ctx, const char* str) {
+  return SSL_CTX_set_cipher_list(ctx, str);
+}
 
 int SSL_CTX_load_verify_locations(SSL_CTX* ctx, const char* ca_file, const char* ca_path) {
   if (!ctx || !ctx->cert_store) return 0;
@@ -1610,11 +1715,11 @@ int SSL_set_tlsext_host_name(SSL* ssl, const char* name) {
   if (!ssl || !name) return 0;
   ssl->hostname = name;
 
-  int effective_verify_mode = ssl->verify_mode;
-  if (!effective_verify_mode && ssl->ctx) effective_verify_mode = ssl->ctx->verify_mode;
-
-  if (ssl->ssl_setup && (effective_verify_mode & SSL_VERIFY_PEER)) {
-    return mbedtls_ssl_set_hostname(&ssl->ssl, ssl->hostname.c_str()) == 0 ? 1 : 0;
+  if (ssl->ssl_setup) {
+    if (!ssl->hostname.empty() && !is_ip_literal(ssl->hostname)) {
+      return mbedtls_ssl_set_hostname(&ssl->ssl, ssl->hostname.c_str()) == 0 ? 1 : 0;
+    }
+    return 1;
   }
   return 1;
 }
@@ -1649,7 +1754,7 @@ int SSL_connect(SSL* ssl) {
     ssl->hostname = ssl->param.host;
   }
 
-  if (!ssl->hostname.empty() && (effective_verify_mode & SSL_VERIFY_PEER)) {
+  if (!ssl->hostname.empty() && !is_ip_literal(ssl->hostname)) {
     mbedtls_ssl_set_hostname(&ssl->ssl, ssl->hostname.c_str());
   }
 

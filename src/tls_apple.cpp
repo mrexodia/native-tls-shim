@@ -12,6 +12,7 @@
 #include <Security/Security.h>
 #include <Security/SecureTransport.h>
 #include <Security/CipherSuite.h>
+#include <Security/SecRandom.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CommonCrypto/CommonDigest.h>
 
@@ -22,6 +23,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -35,6 +37,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -92,18 +95,18 @@ std::string extract_dn_component(const std::string& dn, const std::string& key) 
 
 bool wildcard_match(const std::string& pattern, const std::string& host) {
   if (pattern == host) return true;
-  auto star = pattern.find('*');
-  if (star == std::string::npos) return false;
 
-  auto prefix = pattern.substr(0, star);
-  auto suffix = pattern.substr(star + 1);
-  if (host.size() < prefix.size() + suffix.size()) return false;
-  if (host.compare(0, prefix.size(), prefix) != 0) return false;
-  if (host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0)
-    return false;
+  if (pattern.size() < 3 || pattern[0] != '*' || pattern[1] != '.') return false;
+  if (pattern.find('*', 1) != std::string::npos) return false;
 
-  auto middle = host.substr(prefix.size(), host.size() - prefix.size() - suffix.size());
-  return middle.find('.') == std::string::npos;
+  std::string suffix = pattern.substr(1); // ".example.com"
+  if (host.size() <= suffix.size()) return false;
+  if (host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
+
+  std::string left = host.substr(0, host.size() - suffix.size());
+  if (left.empty() || left.find('.') != std::string::npos) return false;
+
+  return true;
 }
 
 std::string cfstring_to_utf8(CFStringRef s) {
@@ -215,6 +218,43 @@ bool pem_block_to_der(const std::string& pem, std::vector<unsigned char>& der) {
   if (body_end == std::string::npos || body_end <= body_start) return false;
   auto body = pem.substr(body_start + 1, body_end - body_start - 1);
   return base64_decode(body, der);
+}
+
+std::string random_password_hex(size_t bytes) {
+  if (bytes == 0) return {};
+  std::vector<unsigned char> buf(bytes);
+  if (SecRandomCopyBytes(kSecRandomDefault, buf.size(), buf.data()) != errSecSuccess) {
+    for (size_t i = 0; i < buf.size(); ++i) {
+      buf[i] = static_cast<unsigned char>(arc4random() & 0xFF);
+    }
+  }
+  static const char* hex = "0123456789abcdef";
+  std::string out;
+  out.reserve(buf.size() * 2);
+  for (auto b : buf) {
+    out.push_back(hex[(b >> 4) & 0x0F]);
+    out.push_back(hex[b & 0x0F]);
+  }
+  return out;
+}
+
+std::string make_temp_keychain_path() {
+  std::string dir;
+  try {
+    dir = std::filesystem::temp_directory_path().string();
+  } catch (...) {
+    dir = "/tmp";
+  }
+  if (dir.empty()) dir = "/tmp";
+
+  std::string tmpl = dir + "/native_tls_shim_keychain_XXXXXX";
+  std::vector<char> path(tmpl.begin(), tmpl.end());
+  path.push_back('\0');
+  int fd = mkstemp(path.data());
+  if (fd < 0) return {};
+  ::close(fd);
+  ::unlink(path.data());
+  return std::string(path.data());
 }
 
 struct ssl_method_st {
@@ -904,6 +944,9 @@ bool configure_ssl_instance(SSL* ssl) {
     return false;
   }
   SSLProtocol max_proto = kTLSProtocol12;
+#ifdef kTLSProtocol13
+  max_proto = kTLSProtocol13;
+#endif
   st = SSLSetProtocolVersionMax(ssl->ssl, max_proto);
   if (st != noErr) {
     set_error_message("SSLSetProtocolVersionMax failed: " + cferror_to_string(st));
@@ -1080,23 +1123,14 @@ bool evaluate_peer_trust(SSL* ssl, bool require_cert) {
 
   auto effective_verify_mode = ssl->verify_mode ? ssl->verify_mode : ssl->ctx->verify_mode;
   bool verify_peer = (effective_verify_mode & SSL_VERIFY_PEER) != 0;
-
-  if (!verify_peer && !require_cert) {
-    SecTrustRef peer_trust = nullptr;
-    if (SSLCopyPeerTrust(ssl->ssl, &peer_trust) == noErr && peer_trust) {
-      load_peer_certificate(ssl, peer_trust);
-      CFRelease(peer_trust);
-    }
-    ssl->verify_result = X509_V_OK;
-    return run_verify_callback_if_any(ssl) != 0;
-  }
+  bool allow_unverified = !verify_peer && !require_cert;
 
   SecTrustRef trust = nullptr;
   OSStatus st = SSLCopyPeerTrust(ssl->ssl, &trust);
   if (st != noErr || !trust) {
     if (trust) CFRelease(trust);
     ssl->verify_result = X509_V_ERR_UNSPECIFIED;
-    return false;
+    return allow_unverified ? (run_verify_callback_if_any(ssl) != 0) : false;
   }
 
   bool has_cert = load_peer_certificate(ssl, trust);
@@ -1111,57 +1145,77 @@ bool evaluate_peer_trust(SSL* ssl, bool require_cert) {
     return run_verify_callback_if_any(ssl) != 0;
   }
 
-  if (!verify_peer) {
-    ssl->verify_result = X509_V_OK;
-    CFRelease(trust);
-    return run_verify_callback_if_any(ssl) != 0;
-  }
-
   bool has_custom_anchors = ssl->ctx->cert_store && !ssl->ctx->cert_store->certs.empty();
-  if (has_custom_anchors) {
-    CFMutableArrayRef anchors = CFArrayCreateMutable(kCFAllocatorDefault,
-                                                     static_cast<CFIndex>(ssl->ctx->cert_store->certs.size()),
-                                                     &kCFTypeArrayCallBacks);
-    if (anchors) {
-      for (auto* cert : ssl->ctx->cert_store->certs) {
-        if (cert && cert->cert) CFArrayAppendValue(anchors, cert->cert);
+  bool should_evaluate = verify_peer || has_custom_anchors || ssl->ctx->use_system_roots;
+
+  SecTrustRef eval_trust = trust;
+  CFArrayRef certs = nullptr;
+  SecPolicyRef policy = nullptr;
+
+  if (should_evaluate) {
+    CFIndex count = SecTrustGetCertificateCount(trust);
+    if (count > 0) {
+      CFMutableArrayRef cert_array = CFArrayCreateMutable(kCFAllocatorDefault,
+                                                          count,
+                                                          &kCFTypeArrayCallBacks);
+      if (cert_array) {
+        for (CFIndex i = 0; i < count; ++i) {
+          SecCertificateRef cert = SecTrustGetCertificateAtIndex(trust, i);
+          if (cert) CFArrayAppendValue(cert_array, cert);
+        }
+        certs = cert_array;
       }
-      SecTrustSetAnchorCertificates(trust, anchors);
-      SecTrustSetAnchorCertificatesOnly(trust, ssl->ctx->use_system_roots ? false : true);
-      CFRelease(anchors);
     }
-  } else if (!ssl->ctx->use_system_roots) {
-    CFArrayRef empty = CFArrayCreate(kCFAllocatorDefault, nullptr, 0, &kCFTypeArrayCallBacks);
-    if (empty) {
-      SecTrustSetAnchorCertificates(trust, empty);
-      SecTrustSetAnchorCertificatesOnly(trust, true);
-      CFRelease(empty);
+
+    policy = SecPolicyCreateBasicX509();
+
+    if (certs && policy) {
+      SecTrustRef new_trust = nullptr;
+      if (SecTrustCreateWithCertificates(certs, policy, &new_trust) == errSecSuccess &&
+          new_trust) {
+        eval_trust = new_trust;
+      } else if (policy) {
+        SecTrustSetPolicies(eval_trust, policy);
+      }
+    } else if (policy) {
+      SecTrustSetPolicies(eval_trust, policy);
     }
   }
 
-  bool trust_ok = false;
+  if (should_evaluate) {
+    if (has_custom_anchors) {
+      CFMutableArrayRef anchors = CFArrayCreateMutable(kCFAllocatorDefault,
+                                                       static_cast<CFIndex>(ssl->ctx->cert_store->certs.size()),
+                                                       &kCFTypeArrayCallBacks);
+      if (anchors) {
+        for (auto* cert : ssl->ctx->cert_store->certs) {
+          if (cert && cert->cert) CFArrayAppendValue(anchors, cert->cert);
+        }
+        SecTrustSetAnchorCertificates(eval_trust, anchors);
+        SecTrustSetAnchorCertificatesOnly(eval_trust, ssl->ctx->use_system_roots ? false : true);
+        CFRelease(anchors);
+      }
+    } else if (!ssl->ctx->use_system_roots) {
+      CFArrayRef empty = CFArrayCreate(kCFAllocatorDefault, nullptr, 0, &kCFTypeArrayCallBacks);
+      if (empty) {
+        SecTrustSetAnchorCertificates(eval_trust, empty);
+        SecTrustSetAnchorCertificatesOnly(eval_trust, true);
+        CFRelease(empty);
+      }
+    }
+
+    bool trust_ok = false;
 #if defined(__MAC_10_15)
-  trust_ok = SecTrustEvaluateWithError(trust, nullptr);
+    trust_ok = SecTrustEvaluateWithError(eval_trust, nullptr);
 #endif
-  ssl->verify_result = trust_ok ? X509_V_OK : map_trust_result_to_error(trust);
-
-  if (!trust_ok && has_custom_anchors && ssl->peer_cert) {
-    for (auto* cert : ssl->ctx->cert_store->certs) {
-      if (!cert) continue;
-      if (!cert->subject_name.text.empty() &&
-          cert->subject_name.text == ssl->peer_cert->issuer_name.text) {
-        ssl->verify_result = X509_V_OK;
-        trust_ok = true;
-        break;
-      }
-      if (!cert->subject_name.common_name.empty() &&
-          cert->subject_name.common_name == ssl->peer_cert->issuer_name.common_name) {
-        ssl->verify_result = X509_V_OK;
-        trust_ok = true;
-        break;
-      }
-    }
+    ssl->verify_result = trust_ok ? X509_V_OK : map_trust_result_to_error(eval_trust);
+  } else {
+    ssl->verify_result = X509_V_OK;
   }
+
+  if (policy) CFRelease(policy);
+  if (certs) CFRelease(certs);
+  if (eval_trust != trust) CFRelease(eval_trust);
 
   std::string host = ssl->param.host;
   if (ssl->verify_result == X509_V_OK && ssl->ctx->is_client && !host.empty()) {
@@ -1175,6 +1229,10 @@ bool evaluate_peer_trust(SSL* ssl, bool require_cert) {
   if (run_verify_callback_if_any(ssl) == 0) {
     ssl->verify_result = X509_V_ERR_UNSPECIFIED;
     return false;
+  }
+
+  if (allow_unverified) {
+    return true;
   }
 
   return ssl->verify_result == X509_V_OK;
@@ -1217,15 +1275,22 @@ bool ensure_keychain(SSL_CTX* ctx) {
   if (!ctx) return false;
   if (ctx->keychain) return true;
 
-  std::string path = "/tmp/native_tls_shim_" +
-                     std::to_string(static_cast<long long>(getpid())) +
-                     "_" + std::to_string(reinterpret_cast<uintptr_t>(ctx)) + ".keychain";
-  const char* password = "native_tls_shim";
+  std::string path = make_temp_keychain_path();
+  if (path.empty()) {
+    set_error_message("failed to create temporary keychain path");
+    return false;
+  }
+
+  std::string password = random_password_hex(32);
+  if (password.empty()) {
+    set_error_message("failed to generate keychain password");
+    return false;
+  }
 
   SecKeychainRef keychain = nullptr;
   OSStatus st = SecKeychainCreate(path.c_str(),
-                                  static_cast<UInt32>(std::strlen(password)),
-                                  password,
+                                  static_cast<UInt32>(password.size()),
+                                  password.c_str(),
                                   false,
                                   nullptr,
                                   &keychain);
@@ -1233,6 +1298,18 @@ bool ensure_keychain(SSL_CTX* ctx) {
     set_error_message("SecKeychainCreate failed: " + cferror_to_string(st));
     return false;
   }
+
+  OSStatus unlock = SecKeychainUnlock(keychain,
+                                      static_cast<UInt32>(password.size()),
+                                      password.c_str(),
+                                      true);
+  if (unlock != errSecSuccess) {
+    set_error_message("SecKeychainUnlock failed: " + cferror_to_string(unlock));
+    CFRelease(keychain);
+    return false;
+  }
+
+  chmod(path.c_str(), S_IRUSR | S_IWUSR);
 
   ctx->keychain = keychain;
   ctx->keychain_path = path;
@@ -2315,7 +2392,44 @@ int SSL_CTX_use_PrivateKey(SSL_CTX* ctx, EVP_PKEY* pkey) {
 
 int SSL_CTX_check_private_key(const SSL_CTX* ctx) {
   if (!ctx || !ctx->own_cert || !ctx->own_key || !ctx->own_key->key) return 0;
-  return 1;
+  if (!ctx->own_cert->cert) return 0;
+
+  SecKeyRef cert_key = nullptr;
+#if defined(__MAC_10_12)
+  cert_key = SecCertificateCopyKey(ctx->own_cert->cert);
+#else
+  cert_key = SecCertificateCopyPublicKey(ctx->own_cert->cert);
+#endif
+  if (!cert_key) return 0;
+
+  SecKeyRef pub_from_priv = SecKeyCopyPublicKey(ctx->own_key->key);
+  if (!pub_from_priv) {
+    CFRelease(cert_key);
+    return 0;
+  }
+
+  CFErrorRef error = nullptr;
+  CFDataRef cert_data = SecKeyCopyExternalRepresentation(cert_key, &error);
+  if (error) CFRelease(error);
+  error = nullptr;
+  CFDataRef priv_data = SecKeyCopyExternalRepresentation(pub_from_priv, &error);
+  if (error) CFRelease(error);
+
+  bool ok = false;
+  if (cert_data && priv_data) {
+    auto cert_len = CFDataGetLength(cert_data);
+    auto priv_len = CFDataGetLength(priv_data);
+    ok = cert_len == priv_len &&
+         std::memcmp(CFDataGetBytePtr(cert_data), CFDataGetBytePtr(priv_data),
+                     static_cast<size_t>(cert_len)) == 0;
+  }
+
+  if (cert_data) CFRelease(cert_data);
+  if (priv_data) CFRelease(priv_data);
+  CFRelease(cert_key);
+  CFRelease(pub_from_priv);
+
+  return ok ? 1 : 0;
 }
 
 void SSL_CTX_set_default_passwd_cb_userdata(SSL_CTX* ctx, void* u) {

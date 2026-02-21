@@ -129,18 +129,18 @@ std::string extract_dn_component(const std::string& dn, const std::string& key) 
 
 bool wildcard_match(const std::string& pattern, const std::string& host) {
   if (pattern == host) return true;
-  auto star = pattern.find('*');
-  if (star == std::string::npos) return false;
 
-  auto prefix = pattern.substr(0, star);
-  auto suffix = pattern.substr(star + 1);
-  if (host.size() < prefix.size() + suffix.size()) return false;
-  if (host.compare(0, prefix.size(), prefix) != 0) return false;
-  if (host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0)
-    return false;
+  if (pattern.size() < 3 || pattern[0] != '*' || pattern[1] != '.') return false;
+  if (pattern.find('*', 1) != std::string::npos) return false;
 
-  auto middle = host.substr(prefix.size(), host.size() - prefix.size() - suffix.size());
-  return middle.find('.') == std::string::npos;
+  std::string suffix = pattern.substr(1); // ".example.com"
+  if (host.size() <= suffix.size()) return false;
+  if (host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
+
+  std::string left = host.substr(0, host.size() - suffix.size());
+  if (left.empty() || left.find('.') != std::string::npos) return false;
+
+  return true;
 }
 
 struct ssl_method_st {
@@ -1425,6 +1425,62 @@ bool ensure_decrypted_data(SSL* ssl) {
   }
 }
 
+bool send_close_notify(SSL* ssl) {
+  if (!ssl || !ssl->ctxt_valid || ssl->fd < 0) return false;
+
+  if (!ssl->pending_send.empty()) {
+    if (!flush_pending_send(ssl)) return false;
+  }
+
+  if (!ssl->have_sizes) {
+    if (!query_stream_sizes(ssl)) return false;
+  }
+
+  DWORD shutdown_token = SCHANNEL_SHUTDOWN;
+  SecBuffer ctrl_buf{};
+  ctrl_buf.BufferType = SECBUFFER_TOKEN;
+  ctrl_buf.cbBuffer = sizeof(shutdown_token);
+  ctrl_buf.pvBuffer = &shutdown_token;
+  SecBufferDesc ctrl_desc{};
+  ctrl_desc.ulVersion = SECBUFFER_VERSION;
+  ctrl_desc.cBuffers = 1;
+  ctrl_desc.pBuffers = &ctrl_buf;
+
+  SECURITY_STATUS st = ApplyControlToken(&ssl->ctxt, &ctrl_desc);
+  if (st != SEC_E_OK) {
+    ssl->last_error = SSL_ERROR_SSL;
+    ssl->last_ret = -1;
+    set_error_message("ApplyControlToken(SCHANNEL_SHUTDOWN) failed: " +
+                      std::to_string(static_cast<long>(st)));
+    return false;
+  }
+
+  std::vector<unsigned char> packet(ssl->sizes.cbHeader + ssl->sizes.cbTrailer);
+  SecBuffer out_buf{};
+  out_buf.BufferType = SECBUFFER_TOKEN;
+  out_buf.pvBuffer = packet.data();
+  out_buf.cbBuffer = static_cast<unsigned long>(packet.size());
+  SecBufferDesc out_desc{};
+  out_desc.ulVersion = SECBUFFER_VERSION;
+  out_desc.cBuffers = 1;
+  out_desc.pBuffers = &out_buf;
+
+  st = EncryptMessage(&ssl->ctxt, 0, &out_desc, 0);
+  if (st != SEC_E_OK) {
+    ssl->last_error = SSL_ERROR_SSL;
+    ssl->last_ret = -1;
+    set_error_message("EncryptMessage(close_notify) failed: " +
+                      std::to_string(static_cast<long>(st)));
+    return false;
+  }
+
+  if (out_buf.cbBuffer == 0) return true;
+
+  ssl->pending_send.assign(packet.begin(), packet.begin() + out_buf.cbBuffer);
+  ssl->pending_send_offset = 0;
+  return flush_pending_send(ssl);
+}
+
 bool add_cert_to_store(X509_STORE* store, X509* cert, bool allow_duplicate_error) {
   if (!store || !cert || !cert->cert_ctx) return false;
 
@@ -2302,9 +2358,77 @@ int SSL_CTX_set_session_cache_mode(SSL_CTX* ctx, int mode) {
   return mode;
 }
 
-int SSL_CTX_set_cipher_list(SSL_CTX* /*ctx*/, const char* /*str*/) { return 1; }
+static std::string normalize_cipher_token(std::string token) {
+  token = trim(token);
+  for (auto& c : token) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return token;
+}
 
-int SSL_CTX_set_ciphersuites(SSL_CTX* /*ctx*/, const char* /*str*/) { return 1; }
+static bool add_cipher_from_token(const std::string& token) {
+  if (token == "ECDHE-ECDSA-AES128-GCM-SHA256") return true;
+  if (token == "ECDHE-ECDSA-AES256-GCM-SHA384") return true;
+  if (token == "ECDHE-RSA-AES128-GCM-SHA256") return true;
+  if (token == "ECDHE-RSA-AES256-GCM-SHA384") return true;
+  if (token == "DHE-RSA-AES128-GCM-SHA256") return true;
+  if (token == "DHE-RSA-AES256-GCM-SHA384") return true;
+  if (token == "AES128-GCM-SHA256") return true;
+  if (token == "AES256-GCM-SHA384") return true;
+  if (token == "ECDHE-ECDSA-CHACHA20-POLY1305" ||
+      token == "ECDHE-ECDSA-CHACHA20-POLY1305-SHA256") {
+    return true;
+  }
+  if (token == "ECDHE-RSA-CHACHA20-POLY1305" ||
+      token == "ECDHE-RSA-CHACHA20-POLY1305-SHA256") {
+    return true;
+  }
+  return false;
+}
+
+static bool parse_cipher_list_string(const char* str) {
+  if (!str) return false;
+  std::string input(str);
+  if (input.empty()) return false;
+
+  bool any = false;
+  std::string token;
+  auto flush = [&]() {
+    if (token.empty()) return;
+    std::string normalized = normalize_cipher_token(token);
+    token.clear();
+    if (normalized.empty()) return;
+    if (normalized[0] == '!') return;
+    if (normalized == "DEFAULT" || normalized == "HIGH" || normalized == "SECURE") {
+      any = true;
+      return;
+    }
+    if (add_cipher_from_token(normalized)) any = true;
+  };
+
+  for (char ch : input) {
+    if (ch == ':' || ch == ',' || ch == ';' || std::isspace(static_cast<unsigned char>(ch))) {
+      flush();
+    } else {
+      token.push_back(ch);
+    }
+  }
+  flush();
+  return any;
+}
+
+int SSL_CTX_set_cipher_list(SSL_CTX* ctx, const char* str) {
+  if (!ctx || !str) return 0;
+  if (!parse_cipher_list_string(str)) {
+    set_error_message("SSL_CTX_set_cipher_list: no matching cipher suites");
+    return 0;
+  }
+  return 1;
+}
+
+int SSL_CTX_set_ciphersuites(SSL_CTX* ctx, const char* str) {
+  return SSL_CTX_set_cipher_list(ctx, str);
+}
 
 int SSL_CTX_load_verify_locations(SSL_CTX* ctx, const char* ca_file, const char* ca_path) {
 #ifdef _WIN32
@@ -2444,7 +2568,36 @@ int SSL_CTX_use_PrivateKey(SSL_CTX* ctx, EVP_PKEY* pkey) {
 int SSL_CTX_check_private_key(const SSL_CTX* ctx) {
 #ifdef _WIN32
   if (!ctx || !ctx->own_cert || !ctx->own_key) return 0;
-  return 1;
+  if (!ctx->own_cert->cert_ctx) return 0;
+
+  if (ctx->own_key->use_ncrypt) {
+    return 0;
+  }
+  if (!ctx->own_key->hprov) return 0;
+
+  DWORD len = 0;
+  if (!CryptExportPublicKeyInfo(ctx->own_key->hprov,
+                                ctx->own_key->keyspec,
+                                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                nullptr,
+                                &len)) {
+    return 0;
+  }
+
+  std::vector<unsigned char> buf(len);
+  auto* info = reinterpret_cast<CERT_PUBLIC_KEY_INFO*>(buf.data());
+  if (!CryptExportPublicKeyInfo(ctx->own_key->hprov,
+                                ctx->own_key->keyspec,
+                                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                info,
+                                &len)) {
+    return 0;
+  }
+
+  BOOL ok = CertComparePublicKeyInfo(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                     &ctx->own_cert->cert_ctx->pCertInfo->SubjectPublicKeyInfo,
+                                     info);
+  return ok ? 1 : 0;
 #else
   (void)ctx;
   return 0;
@@ -2784,6 +2937,11 @@ int SSL_shutdown(SSL* ssl) {
   if (!ssl) return 0;
 
   if (!ssl->shutdown_sent && ssl->fd >= 0) {
+    if (ssl->ctxt_valid) {
+      if (!send_close_notify(ssl)) {
+        return 0;
+      }
+    }
     shutdown(ssl->fd, SD_SEND);
     ssl->shutdown_sent = true;
   }

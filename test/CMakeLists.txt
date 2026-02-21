@@ -74,6 +74,21 @@ add_executable(test_httplib_mtls test_httplib_mtls.cpp)
 target_compile_definitions(test_httplib_mtls PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(test_httplib_mtls PRIVATE httplib::httplib OpenSSL::SSL OpenSSL::Crypto)
 
+add_executable(test_httplib_spoofed_ca test_httplib_spoofed_ca.cpp)
+target_compile_definitions(test_httplib_spoofed_ca PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_httplib_spoofed_ca PRIVATE httplib::httplib OpenSSL::SSL OpenSSL::Crypto)
+
+add_executable(test_wildcard_host_validation test_wildcard_host_validation.cpp)
+target_compile_definitions(test_wildcard_host_validation PRIVATE NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_wildcard_host_validation PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
+add_executable(test_cipher_list_validation test_cipher_list_validation.cpp)
+target_link_libraries(test_cipher_list_validation PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
+add_executable(test_private_key_mismatch test_private_key_mismatch.cpp)
+target_compile_definitions(test_private_key_mismatch PRIVATE NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_private_key_mismatch PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
 add_executable(test_evp_hash test_evp_hash.cpp)
 target_link_libraries(test_evp_hash PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
@@ -103,6 +118,10 @@ add_test(NAME test_httplib_peer_cert COMMAND test_httplib_peer_cert)
 add_test(NAME test_httplib_hostname_mismatch COMMAND test_httplib_hostname_mismatch)
 add_test(NAME test_httplib_in_memory_ca COMMAND test_httplib_in_memory_ca)
 add_test(NAME test_httplib_mtls COMMAND test_httplib_mtls)
+add_test(NAME test_httplib_spoofed_ca COMMAND test_httplib_spoofed_ca)
+add_test(NAME test_wildcard_host_validation COMMAND test_wildcard_host_validation)
+add_test(NAME test_cipher_list_validation COMMAND test_cipher_list_validation)
+add_test(NAME test_private_key_mismatch COMMAND test_private_key_mismatch)
 add_test(NAME test_evp_hash COMMAND test_evp_hash)
 add_test(NAME test_ixwebsocket_client COMMAND test_ixwebsocket_client)
 add_test(NAME test_ixwebsocket_server COMMAND test_ixwebsocket_server)
