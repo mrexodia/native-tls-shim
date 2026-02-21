@@ -18,38 +18,28 @@ jobs:
             os: windows-latest
             backend: AUTO
             fetch_mbedtls: "OFF"
-            build_tests: "ON"
-            run_tests: "true"
 
           - name: windows-forced-mbedtls
             os: windows-latest
             backend: MBEDTLS
             fetch_mbedtls: "ON"
-            build_tests: "ON"
-            run_tests: "true"
 
           # macOS: native (AUTO -> APPLE) + forced mbedTLS
           - name: macos-native-apple
             os: macos-latest
             backend: AUTO
             fetch_mbedtls: "OFF"
-            build_tests: "ON"
-            run_tests: "true"
 
           - name: macos-forced-mbedtls
             os: macos-latest
             backend: MBEDTLS
             fetch_mbedtls: "ON"
-            build_tests: "ON"
-            run_tests: "true"
 
           # Linux: only mbedTLS needed (native AUTO also resolves to mbedTLS)
           - name: ubuntu-forced-mbedtls
             os: ubuntu-latest
             backend: MBEDTLS
             fetch_mbedtls: "ON"
-            build_tests: "ON"
-            run_tests: "true"
 
     steps:
       - name: Checkout
@@ -69,8 +59,8 @@ jobs:
           -DPython3_EXECUTABLE=${{ env.PYTHON_FOR_CMAKE }}
           -DNATIVE_TLS_SHIM_BACKEND=${{ matrix.backend }}
           -DNATIVE_TLS_SHIM_FETCH_MBEDTLS=${{ matrix.fetch_mbedtls }}
-          -DNATIVE_TLS_SHIM_BUILD_TESTS=${{ matrix.build_tests }}
-          -DNATIVE_TLS_SHIM_BUILD_EXAMPLES=OFF
+          -DNATIVE_TLS_SHIM_BUILD_TESTS=ON
+          -DNATIVE_TLS_SHIM_BUILD_EXAMPLES=ON
           -DNATIVE_TLS_SHIM_ENABLE_INSTALL=OFF
           -DCMAKE_BUILD_TYPE=Debug
 
@@ -78,6 +68,8 @@ jobs:
         run: cmake --build build --config Debug --parallel
 
       - name: Test
-        if: matrix.run_tests == 'true'
         run: >-
           ctest --test-dir build -C Debug --output-on-failure
+
+      - name: Httplib cipher suite check
+        run: ./build/example/httplib_example
