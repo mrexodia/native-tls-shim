@@ -59,6 +59,9 @@ def run():
     server_build = build_dir / "tls13_server"
     venv_dir = server_build / ".venv"
 
+    config = os.environ.get("CTEST_CONFIGURATION_TYPE")
+    build_config = config or "Debug"
+
     python_exe = ensure_venv(venv_dir)
     cmake_config = [
         "cmake",
@@ -69,13 +72,19 @@ def run():
         f"-DPython3_EXECUTABLE={python_exe}",
         "-DCMAKE_BUILD_TYPE=Debug",
     ]
-    cmake_build = ["cmake", "--build", str(server_build), "--config", "Debug", "--parallel"]
+    cmake_build = ["cmake", "--build", str(server_build), "--parallel"]
+    if config:
+        cmake_build += ["--config", build_config]
 
     subprocess.check_call(cmake_config)
     subprocess.check_call(cmake_build)
 
-    server_bin = exe_path(server_build / "tls13_only_server")
-    client_bin = exe_path(build_dir / "test" / "test_tls13_only_client")
+    if config:
+        server_bin = exe_path(server_build / build_config / "tls13_only_server")
+        client_bin = exe_path(build_dir / "test" / build_config / "test_tls13_only_client")
+    else:
+        server_bin = exe_path(server_build / "tls13_only_server")
+        client_bin = exe_path(build_dir / "test" / "test_tls13_only_client")
 
     if not server_bin.exists():
         raise FileNotFoundError(f"Server binary not found: {server_bin}")
