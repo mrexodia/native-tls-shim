@@ -1019,11 +1019,10 @@ long map_policy_error_to_verify_error(DWORD err) {
   return X509_V_ERR_UNSPECIFIED;
 }
 
-long verify_peer_chain(SSL* ssl, PCCERT_CONTEXT peer_cert) {
+long verify_peer_chain(SSL* ssl, PCCERT_CONTEXT peer_cert, bool verify_peer) {
   if (!ssl || !ssl->ctx || !peer_cert) return X509_V_ERR_UNSPECIFIED;
 
-  auto effective_verify_mode = ssl->verify_mode ? ssl->verify_mode : ssl->ctx->verify_mode;
-  if (!(effective_verify_mode & SSL_VERIFY_PEER)) return X509_V_OK;
+  if (!verify_peer) return X509_V_OK;
 
   bool has_custom_roots =
       ssl->ctx->cert_store && ssl->ctx->cert_store->store && !ssl->ctx->cert_store->certs.empty();
@@ -1138,7 +1137,14 @@ bool post_handshake_verify(SSL* ssl) {
     CertFreeCertificateContext(remote);
   }
 
-  if (!(effective_verify_mode & SSL_VERIFY_PEER)) {
+  bool has_custom_roots =
+      ssl->ctx->cert_store && ssl->ctx->cert_store->store && !ssl->ctx->cert_store->certs.empty();
+  bool should_verify = (effective_verify_mode & SSL_VERIFY_PEER) != 0;
+  if (!should_verify && ssl->ctx->is_client && (has_custom_roots || ssl->ctx->use_system_roots)) {
+    should_verify = true;
+  }
+
+  if (!should_verify) {
     ssl->verify_result = X509_V_OK;
     return run_verify_callback_if_any(ssl) != 0;
   }
@@ -1155,7 +1161,7 @@ bool post_handshake_verify(SSL* ssl) {
     return run_verify_callback_if_any(ssl) != 0;
   }
 
-  ssl->verify_result = verify_peer_chain(ssl, ssl->peer_cert->cert_ctx);
+  ssl->verify_result = verify_peer_chain(ssl, ssl->peer_cert->cert_ctx, should_verify);
 
   if (run_verify_callback_if_any(ssl) == 0) {
     ssl->last_error = SSL_ERROR_SSL;

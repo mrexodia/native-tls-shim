@@ -477,16 +477,38 @@ int verify_mode_to_authmode(int mode, bool is_server) {
   return MBEDTLS_SSL_VERIFY_REQUIRED;
 }
 
+bool ctx_has_ca_store(const SSL_CTX* ctx) {
+  return ctx && ctx->cert_store && !ctx->cert_store->certs.empty();
+}
+
+bool ctx_should_verify_peer(const SSL_CTX* ctx) {
+  if (!ctx) return false;
+  if (ctx->verify_mode & SSL_VERIFY_PEER) return true;
+  return ctx->is_client && ctx_has_ca_store(ctx);
+}
+
+bool ssl_should_verify_peer(const SSL* ssl) {
+  if (!ssl || !ssl->ctx) return false;
+  if (ssl->verify_mode & SSL_VERIFY_PEER) return true;
+  return ctx_should_verify_peer(ssl->ctx);
+}
+
 void apply_ctx_verify_mode(SSL_CTX* ctx) {
   if (!ctx) return;
-  int auth = verify_mode_to_authmode(ctx->verify_mode, !ctx->is_client);
+  int auth = MBEDTLS_SSL_VERIFY_NONE;
+  if (ctx->verify_mode & SSL_VERIFY_PEER) {
+    auth = verify_mode_to_authmode(ctx->verify_mode, !ctx->is_client);
+  } else if (ctx->is_client && ctx_has_ca_store(ctx)) {
+    auth = MBEDTLS_SSL_VERIFY_REQUIRED;
+  }
   mbedtls_ssl_conf_authmode(&ctx->conf, auth);
 }
 
 void apply_ctx_ca_store(SSL_CTX* ctx) {
   if (!ctx) return;
 
-  if (!(ctx->verify_mode & SSL_VERIFY_PEER)) {
+  bool should_set = ctx_should_verify_peer(ctx);
+  if (!should_set) {
     mbedtls_ssl_conf_ca_chain(&ctx->conf, nullptr, nullptr);
     return;
   }
@@ -580,8 +602,15 @@ bool setup_ssl_instance(SSL* ssl) {
     set_error_message(std::string("mbedtls_ssl_setup failed: ") + err);
     return false;
   }
-  int auth = verify_mode_to_authmode(ssl->verify_mode ? ssl->verify_mode : ssl->ctx->verify_mode,
-                                     !ssl->ctx->is_client);
+  int auth = MBEDTLS_SSL_VERIFY_NONE;
+  if (ssl->verify_mode & SSL_VERIFY_PEER) {
+    auth = verify_mode_to_authmode(ssl->verify_mode, !ssl->ctx->is_client);
+  } else if (ssl->ctx && ssl->ctx->is_client && ctx_has_ca_store(ssl->ctx)) {
+    auth = MBEDTLS_SSL_VERIFY_REQUIRED;
+  } else if (!(ssl->verify_mode & SSL_VERIFY_PEER) && ssl->ctx &&
+             (ssl->ctx->verify_mode & SSL_VERIFY_PEER)) {
+    auth = verify_mode_to_authmode(ssl->ctx->verify_mode, !ssl->ctx->is_client);
+  }
   mbedtls_ssl_set_hs_authmode(&ssl->ssl, auth);
 
   ssl->ssl_setup = true;
@@ -1738,7 +1767,14 @@ void SSL_set_verify(SSL* ssl, int mode,
   ssl->verify_mode = mode;
   ssl->verify_callback = verify_callback;
   if (ssl->ssl_setup && ssl->ctx) {
-    int auth = verify_mode_to_authmode(mode, !ssl->ctx->is_client);
+    int auth = MBEDTLS_SSL_VERIFY_NONE;
+    if (mode & SSL_VERIFY_PEER) {
+      auth = verify_mode_to_authmode(mode, !ssl->ctx->is_client);
+    } else if (ssl->ctx->is_client && ctx_has_ca_store(ssl->ctx)) {
+      auth = MBEDTLS_SSL_VERIFY_REQUIRED;
+    } else if (!(mode & SSL_VERIFY_PEER) && (ssl->ctx->verify_mode & SSL_VERIFY_PEER)) {
+      auth = verify_mode_to_authmode(ssl->ctx->verify_mode, !ssl->ctx->is_client);
+    }
     mbedtls_ssl_set_hs_authmode(&ssl->ssl, auth);
   }
 }
