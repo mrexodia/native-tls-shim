@@ -109,6 +109,12 @@ if(WIN32)
   endif()
 endif()
 
+if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "APPLE")
+  target_link_libraries(native_tls_shim PRIVATE
+    "$<LINK_LIBRARY:FRAMEWORK,Security>"
+    "$<LINK_LIBRARY:FRAMEWORK,CoreFoundation>")
+endif()
+
 target_compile_definitions(native_tls_shim
   PUBLIC
     OPENSSL_VERSION_NUMBER=0x30000000L

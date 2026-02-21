@@ -1,7 +1,2519 @@
-#include "tls_apple.h"
+#include "tls_internal.hpp"
 
-namespace native_tls::apple {
+#include "openssl/bio.h"
+#include "openssl/crypto.h"
+#include "openssl/err.h"
+#include "openssl/evp.h"
+#include "openssl/pem.h"
+#include "openssl/ssl.h"
+#include "openssl/x509.h"
+#include "openssl/x509v3.h"
 
-// Placeholder for future SecureTransport backend.
+#include <Security/Security.h>
+#include <Security/SecureTransport.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <CommonCrypto/CommonDigest.h>
 
-} // namespace native_tls::apple
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+constexpr unsigned long make_error_code(int lib, int reason) {
+  return (static_cast<unsigned long>(lib & 0xFF) << 24) |
+         static_cast<unsigned long>(reason & 0xFFFFFF);
+}
+
+inline void set_error_message(const std::string& msg, int reason = 1,
+                              int lib = ERR_LIB_X509) {
+  native_tls::set_last_error(make_error_code(lib, reason), msg);
+}
+
+inline void clear_error_message() { native_tls::set_last_error(0, {}); }
+
+using socket_len_t = socklen_t;
+
+int close_socket_fd(int fd) { return close(fd); }
+
+bool set_fd_nonblocking(int fd, bool on) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return false;
+  if (on)
+    flags |= O_NONBLOCK;
+  else
+    flags &= ~O_NONBLOCK;
+  return fcntl(fd, F_SETFL, flags) == 0;
+}
+
+time_t timegm_utc(std::tm* tmv) { return timegm(tmv); }
+
+std::string trim(std::string s) {
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
+    s.erase(s.begin());
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+    s.pop_back();
+  return s;
+}
+
+std::string extract_dn_component(const std::string& dn, const std::string& key) {
+  auto pattern = key + "=";
+  auto pos = dn.find(pattern);
+  if (pos == std::string::npos) return {};
+  pos += pattern.size();
+  auto end = dn.find(',', pos);
+  if (end == std::string::npos) end = dn.size();
+  return trim(dn.substr(pos, end - pos));
+}
+
+bool wildcard_match(const std::string& pattern, const std::string& host) {
+  if (pattern == host) return true;
+  auto star = pattern.find('*');
+  if (star == std::string::npos) return false;
+
+  auto prefix = pattern.substr(0, star);
+  auto suffix = pattern.substr(star + 1);
+  if (host.size() < prefix.size() + suffix.size()) return false;
+  if (host.compare(0, prefix.size(), prefix) != 0) return false;
+  if (host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0)
+    return false;
+
+  auto middle = host.substr(prefix.size(), host.size() - prefix.size() - suffix.size());
+  return middle.find('.') == std::string::npos;
+}
+
+std::string cfstring_to_utf8(CFStringRef s) {
+  if (!s) return {};
+  CFIndex len = CFStringGetLength(s);
+  if (len == 0) return {};
+  CFIndex max = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+  std::string out(static_cast<size_t>(max), '\0');
+  if (!CFStringGetCString(s, out.data(), max, kCFStringEncodingUTF8)) return {};
+  out.resize(std::strlen(out.c_str()));
+  return out;
+}
+
+std::string cferror_to_string(OSStatus status) {
+  CFStringRef err = SecCopyErrorMessageString(status, nullptr);
+  std::string out = err ? cfstring_to_utf8(err) : std::string();
+  if (err) CFRelease(err);
+  if (out.empty()) {
+    out = "OSStatus=" + std::to_string(static_cast<int>(status));
+  }
+  return out;
+}
+
+std::string read_file_text(const char* path) {
+  if (!path) return {};
+  std::ifstream ifs(path, std::ios::binary);
+  if (!ifs) return {};
+  std::string out((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+  return out;
+}
+
+int base64_index(unsigned char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+bool base64_decode(const std::string& input, std::vector<unsigned char>& out) {
+  int val = 0;
+  int valb = -8;
+  for (unsigned char c : input) {
+    if (std::isspace(c)) continue;
+    if (c == '=') break;
+    int d = base64_index(c);
+    if (d < 0) continue;
+    val = (val << 6) + d;
+    valb += 6;
+    if (valb >= 0) {
+      out.push_back(static_cast<unsigned char>((val >> valb) & 0xFF));
+      valb -= 8;
+    }
+  }
+  return !out.empty();
+}
+
+std::string base64_encode(const unsigned char* data, size_t len) {
+  static const char* alphabet =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((len + 2) / 3) * 4);
+  for (size_t i = 0; i < len; i += 3) {
+    unsigned int v = data[i];
+    v = (v << 8) | (i + 1 < len ? data[i + 1] : 0);
+    v = (v << 8) | (i + 2 < len ? data[i + 2] : 0);
+
+    out.push_back(alphabet[(v >> 18) & 0x3F]);
+    out.push_back(alphabet[(v >> 12) & 0x3F]);
+    if (i + 1 < len)
+      out.push_back(alphabet[(v >> 6) & 0x3F]);
+    else
+      out.push_back('=');
+    if (i + 2 < len)
+      out.push_back(alphabet[v & 0x3F]);
+    else
+      out.push_back('=');
+  }
+  return out;
+}
+
+std::string wrap_pem(const char* tag, const unsigned char* data, size_t len) {
+  if (!tag || !data || len == 0) return {};
+  auto b64 = base64_encode(data, len);
+  if (b64.empty()) return {};
+
+  std::string out;
+  out += "-----BEGIN ";
+  out += tag;
+  out += "-----\n";
+  for (size_t i = 0; i < b64.size(); i += 64) {
+    out.append(b64.substr(i, std::min<size_t>(64, b64.size() - i)));
+    out.push_back('\n');
+  }
+  out += "-----END ";
+  out += tag;
+  out += "-----\n";
+  return out;
+}
+
+bool pem_block_to_der(const std::string& pem, std::vector<unsigned char>& der) {
+  auto begin = pem.find("-----BEGIN");
+  auto end = pem.find("-----END");
+  if (begin == std::string::npos || end == std::string::npos) return false;
+  auto body_start = pem.find('\n', begin);
+  if (body_start == std::string::npos) return false;
+  auto body_end = pem.rfind("-----END");
+  if (body_end == std::string::npos || body_end <= body_start) return false;
+  auto body = pem.substr(body_start + 1, body_end - body_start - 1);
+  return base64_decode(body, der);
+}
+
+struct ssl_method_st {
+  int endpoint = 0; // 0 client, 1 server
+};
+
+struct asn1_string_st {
+  std::vector<unsigned char> bytes;
+};
+
+struct asn1_time_st {
+  time_t epoch = 0;
+};
+
+struct bignum_st {
+  std::vector<unsigned char> bytes;
+};
+
+struct x509_name_st {
+  std::string text;
+  std::string common_name;
+};
+
+struct x509_st {
+  SecCertificateRef cert = nullptr;
+  std::vector<unsigned char> der;
+  std::string pem;
+  int refs = 1;
+  x509_name_st subject_name;
+  x509_name_st issuer_name;
+  asn1_string_st serial;
+  asn1_time_st not_before;
+  asn1_time_st not_after;
+
+  ~x509_st() {
+    if (cert) CFRelease(cert);
+  }
+};
+
+struct x509_crl_st {};
+
+struct x509_object_st {
+  int type = X509_LU_X509;
+  X509* cert = nullptr;
+};
+
+struct stack_st_X509_OBJECT {
+  std::vector<x509_object_st> items;
+};
+
+struct stack_st_X509_NAME {
+  std::vector<X509_NAME*> names;
+};
+
+struct stack_x509_info_st {
+  std::vector<X509_INFO*> items;
+};
+
+struct x509_store_st {
+  std::vector<X509*> certs;
+  unsigned long flags = 0;
+  stack_st_X509_OBJECT object_cache;
+};
+
+struct x509_verify_param_st {
+  std::string host;
+  unsigned int hostflags = 0;
+};
+
+struct x509_store_ctx_st {
+  SSL* ssl = nullptr;
+  X509* current_cert = nullptr;
+  int error = X509_V_OK;
+  int depth = 0;
+};
+
+struct bio_method_st {
+  int kind;
+};
+
+enum class BioKind { Socket, Memory };
+
+struct bio_st {
+  BioKind kind = BioKind::Memory;
+  int fd = -1;
+  bool close_on_free = false;
+  std::vector<unsigned char> data;
+  size_t offset = 0;
+};
+
+enum class DigestKind { Md5, Sha256, Sha512 };
+
+struct evp_pkey_st {
+  SecKeyRef key = nullptr;
+  bool has_key = false;
+  std::string pem;
+  int refs = 1;
+
+  ~evp_pkey_st() {
+    if (key) CFRelease(key);
+  }
+};
+
+struct evp_md_st {
+  DigestKind kind;
+  unsigned int digest_len;
+};
+
+struct evp_md_ctx_st {
+  DigestKind kind = DigestKind::Md5;
+  bool setup = false;
+  union {
+    CC_MD5_CTX md5;
+    CC_SHA256_CTX sha256;
+    CC_SHA512_CTX sha512;
+  } u;
+};
+
+struct ssl_ctx_st {
+  bool is_client = true;
+  int verify_mode = SSL_VERIFY_NONE;
+  int verify_depth = 0;
+  int (*verify_callback)(int, X509_STORE_CTX*) = nullptr;
+
+  long mode = 0;
+  long options = 0;
+  int session_cache_mode = SSL_SESS_CACHE_OFF;
+  int min_proto_version = TLS1_2_VERSION;
+
+  void* passwd_userdata = nullptr;
+
+  X509_STORE* cert_store = nullptr;
+  stack_st_X509_NAME* client_ca_list = nullptr;
+
+  X509* own_cert = nullptr;
+  EVP_PKEY* own_key = nullptr;
+  std::vector<SecCertificateRef> own_chain;
+
+  SecIdentityRef identity = nullptr;
+  SecKeychainRef keychain = nullptr;
+  std::string keychain_path;
+
+  std::vector<std::string> alpn_protocols;
+
+  bool use_system_roots = false;
+
+  ~ssl_ctx_st() {
+    if (client_ca_list) sk_X509_NAME_pop_free(client_ca_list, X509_NAME_free);
+    if (cert_store) X509_STORE_free(cert_store);
+    if (own_cert) X509_free(own_cert);
+    if (own_key) EVP_PKEY_free(own_key);
+    for (auto* c : own_chain) {
+      if (c) CFRelease(c);
+    }
+    if (identity) CFRelease(identity);
+    if (keychain) {
+      SecKeychainDelete(keychain);
+      CFRelease(keychain);
+    }
+    if (!keychain_path.empty()) {
+      std::error_code ec;
+      std::filesystem::remove(keychain_path, ec);
+    }
+  }
+};
+
+struct ssl_st {
+  SSL_CTX* ctx = nullptr;
+  SSLContextRef ssl = nullptr;
+  bool ssl_setup = false;
+
+  int fd = -1;
+  BIO* rbio = nullptr;
+  BIO* wbio = nullptr;
+
+  int verify_mode = SSL_VERIFY_NONE;
+  int (*verify_callback)(int, X509_STORE_CTX*) = nullptr;
+
+  int last_error = SSL_ERROR_NONE;
+  int last_ret = 1;
+
+  std::string hostname;
+  std::string selected_alpn;
+  x509_verify_param_st param;
+
+  std::vector<unsigned char> peeked_plaintext;
+
+  long verify_result = X509_V_OK;
+
+  X509* peer_cert = nullptr;
+
+  int io_want = SSL_ERROR_NONE;
+  bool handshake_done = false;
+  bool trust_evaluated = false;
+
+  ~ssl_st() {
+    if (peer_cert) X509_free(peer_cert);
+    if (rbio) {
+      if (wbio == rbio) {
+        BIO_free(rbio);
+      } else {
+        BIO_free(rbio);
+        if (wbio) BIO_free(wbio);
+      }
+      rbio = nullptr;
+      wbio = nullptr;
+    }
+    if (ssl) {
+      SSLClose(ssl);
+      CFRelease(ssl);
+    }
+  }
+};
+
+const ssl_method_st g_client_method{0};
+const ssl_method_st g_server_method{1};
+const bio_method_st g_mem_method{1};
+
+const EVP_MD g_md5{DigestKind::Md5, CC_MD5_DIGEST_LENGTH};
+const EVP_MD g_sha256{DigestKind::Sha256, CC_SHA256_DIGEST_LENGTH};
+const EVP_MD g_sha512{DigestKind::Sha512, CC_SHA512_DIGEST_LENGTH};
+
+std::string label_to_short_name(const std::string& label) {
+  if (label == "Common Name") return "CN";
+  if (label == "Organization") return "O";
+  if (label == "Organizational Unit") return "OU";
+  if (label == "Country") return "C";
+  if (label == "State/Province") return "ST";
+  if (label == "Locality") return "L";
+  return label;
+}
+
+bool copy_name_info(SecCertificateRef cert, CFStringRef oid,
+                    std::string& text_out, std::string* cn_out) {
+  if (!cert || !oid) return false;
+  const void* key_list[] = { oid };
+  CFArrayRef keys = CFArrayCreate(kCFAllocatorDefault,
+                                 key_list,
+                                 1,
+                                 &kCFTypeArrayCallBacks);
+  if (!keys) return false;
+  CFDictionaryRef values = SecCertificateCopyValues(cert, keys, nullptr);
+  CFRelease(keys);
+  if (!values) return false;
+
+  auto* name_dict = static_cast<CFDictionaryRef>(CFDictionaryGetValue(values, oid));
+  if (!name_dict) {
+    CFRelease(values);
+    return false;
+  }
+
+  auto* val = static_cast<CFArrayRef>(CFDictionaryGetValue(name_dict, kSecPropertyKeyValue));
+  if (!val) {
+    CFRelease(values);
+    return false;
+  }
+
+  std::string out;
+  CFIndex count = CFArrayGetCount(val);
+  for (CFIndex i = 0; i < count; ++i) {
+    auto* entry = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(val, i));
+    if (!entry) continue;
+    auto* label = static_cast<CFStringRef>(CFDictionaryGetValue(entry, kSecPropertyKeyLabel));
+    auto* value = CFDictionaryGetValue(entry, kSecPropertyKeyValue);
+    std::string label_str = label ? cfstring_to_utf8(label) : std::string();
+    std::string value_str;
+    if (value) {
+      if (CFGetTypeID(value) == CFStringGetTypeID()) {
+        value_str = cfstring_to_utf8(static_cast<CFStringRef>(value));
+      } else {
+        CFStringRef desc = CFCopyDescription(value);
+        value_str = desc ? cfstring_to_utf8(desc) : std::string();
+        if (desc) CFRelease(desc);
+      }
+    }
+    if (label_str == "Common Name" && cn_out) {
+      *cn_out = value_str;
+    }
+    if (!label_str.empty() && !value_str.empty()) {
+      if (!out.empty()) out += ", ";
+      out += label_to_short_name(label_str);
+      out += "=";
+      out += value_str;
+    }
+  }
+
+  if (!out.empty()) text_out = out;
+  CFRelease(values);
+  return !text_out.empty();
+}
+
+time_t cfdate_to_time_t(CFDateRef date) {
+  if (!date) return 0;
+  CFAbsoluteTime at = CFDateGetAbsoluteTime(date);
+  return static_cast<time_t>(at + kCFAbsoluteTimeIntervalSince1970);
+}
+
+bool extract_validity_time(SecCertificateRef cert, CFStringRef oid, time_t& out_time) {
+  const void* key_list[] = { oid };
+  CFArrayRef keys = CFArrayCreate(kCFAllocatorDefault,
+                                 key_list,
+                                 1,
+                                 &kCFTypeArrayCallBacks);
+  if (!keys) return false;
+  CFDictionaryRef values = SecCertificateCopyValues(cert, keys, nullptr);
+  CFRelease(keys);
+  if (!values) return false;
+  auto* item = static_cast<CFDictionaryRef>(CFDictionaryGetValue(values, oid));
+  if (!item) {
+    CFRelease(values);
+    return false;
+  }
+  auto* val = CFDictionaryGetValue(item, kSecPropertyKeyValue);
+  if (!val) {
+    CFRelease(values);
+    return false;
+  }
+  if (CFGetTypeID(val) == CFDateGetTypeID()) {
+    out_time = cfdate_to_time_t(static_cast<CFDateRef>(val));
+    CFRelease(values);
+    return true;
+  }
+  if (CFGetTypeID(val) == CFStringGetTypeID()) {
+    // Fallback: parse as absolute time string not easily, skip
+    out_time = 0;
+  }
+  CFRelease(values);
+  return out_time != 0;
+}
+
+void refresh_x509_fields(X509* x) {
+  if (!x || !x->cert) return;
+
+  std::string subject_text;
+  std::string issuer_text;
+  std::string issuer_cn;
+
+  copy_name_info(x->cert, kSecOIDX509V1SubjectName, subject_text, &x->subject_name.common_name);
+  copy_name_info(x->cert, kSecOIDX509V1IssuerName, issuer_text, &issuer_cn);
+
+  if (x->subject_name.common_name.empty()) {
+    CFStringRef cn = nullptr;
+    if (SecCertificateCopyCommonName(x->cert, &cn) == errSecSuccess && cn) {
+      x->subject_name.common_name = cfstring_to_utf8(cn);
+      CFRelease(cn);
+    }
+  }
+
+  x->issuer_name.common_name = issuer_cn;
+
+  x->subject_name.text = subject_text;
+  x->issuer_name.text = issuer_text;
+
+  if (x->subject_name.text.empty() && !x->subject_name.common_name.empty()) {
+    x->subject_name.text = "CN=" + x->subject_name.common_name;
+  }
+  if (x->issuer_name.text.empty() && !x->issuer_name.common_name.empty()) {
+    x->issuer_name.text = "CN=" + x->issuer_name.common_name;
+  }
+
+  x->serial.bytes.clear();
+#if defined(__MAC_10_12)
+  CFErrorRef error = nullptr;
+  CFDataRef serial = SecCertificateCopySerialNumberData(x->cert, &error);
+  if (serial) {
+    auto* p = CFDataGetBytePtr(serial);
+    auto len = CFDataGetLength(serial);
+    x->serial.bytes.assign(p, p + len);
+    CFRelease(serial);
+  }
+  if (error) CFRelease(error);
+#endif
+  if (x->serial.bytes.empty()) {
+    const void* key_list[] = { kSecOIDX509V1SerialNumber };
+    CFArrayRef keys = CFArrayCreate(kCFAllocatorDefault,
+                                   key_list,
+                                   1,
+                                   &kCFTypeArrayCallBacks);
+    if (keys) {
+      CFDictionaryRef values = SecCertificateCopyValues(x->cert, keys, nullptr);
+      CFRelease(keys);
+      if (values) {
+        auto* item = static_cast<CFDictionaryRef>(CFDictionaryGetValue(values, kSecOIDX509V1SerialNumber));
+        if (item) {
+          auto* val = CFDictionaryGetValue(item, kSecPropertyKeyValue);
+          if (val && CFGetTypeID(val) == CFDataGetTypeID()) {
+            auto* p = CFDataGetBytePtr(static_cast<CFDataRef>(val));
+            auto len = CFDataGetLength(static_cast<CFDataRef>(val));
+            x->serial.bytes.assign(p, p + len);
+          }
+        }
+        CFRelease(values);
+      }
+    }
+  }
+
+  time_t nb = 0;
+  time_t na = 0;
+  extract_validity_time(x->cert, kSecOIDX509V1ValidityNotBefore, nb);
+  extract_validity_time(x->cert, kSecOIDX509V1ValidityNotAfter, na);
+  x->not_before.epoch = nb;
+  x->not_after.epoch = na;
+}
+
+X509* x509_from_der(const unsigned char* der, size_t len) {
+  if (!der || len == 0) return nullptr;
+  CFDataRef data = CFDataCreate(kCFAllocatorDefault, der, static_cast<CFIndex>(len));
+  if (!data) return nullptr;
+  SecCertificateRef cert = SecCertificateCreateWithData(kCFAllocatorDefault, data);
+  CFRelease(data);
+  if (!cert) return nullptr;
+
+  auto* x = new X509();
+  x->cert = cert;
+  x->der.assign(der, der + len);
+  refresh_x509_fields(x);
+  return x;
+}
+
+X509* x509_clone(const X509* in) {
+  if (!in || in->der.empty()) return nullptr;
+  return x509_from_der(in->der.data(), in->der.size());
+}
+
+X509* x509_from_sec_cert(SecCertificateRef cert) {
+  if (!cert) return nullptr;
+  CFRetain(cert);
+  auto* x = new X509();
+  x->cert = cert;
+  CFDataRef data = SecCertificateCopyData(cert);
+  if (data) {
+    auto* p = CFDataGetBytePtr(data);
+    auto len = CFDataGetLength(data);
+    x->der.assign(p, p + len);
+    CFRelease(data);
+  }
+  refresh_x509_fields(x);
+  return x;
+}
+
+bool add_cert_to_store(X509_STORE* store, X509* cert, bool allow_duplicate_error) {
+  if (!store || !cert) return false;
+
+  for (auto* existing : store->certs) {
+    if (!existing) continue;
+    if (existing->der.size() == cert->der.size() && !existing->der.empty() &&
+        std::memcmp(existing->der.data(), cert->der.data(), cert->der.size()) == 0) {
+      if (!allow_duplicate_error) return true;
+      set_error_message("certificate already in store", X509_R_CERT_ALREADY_IN_HASH_TABLE);
+      return false;
+    }
+  }
+
+  X509_up_ref(cert);
+  store->certs.push_back(cert);
+  return true;
+}
+
+bool next_pem_block(BIO* bio, const char* begin_tag, const char* end_tag,
+                    std::string& out_block) {
+  if (!bio || bio->kind != BioKind::Memory) return false;
+  if (bio->offset >= bio->data.size()) return false;
+
+  std::string text(reinterpret_cast<const char*>(bio->data.data()), bio->data.size());
+  auto begin = text.find(begin_tag, bio->offset);
+  if (begin == std::string::npos) return false;
+  auto end = text.find(end_tag, begin);
+  if (end == std::string::npos) return false;
+  end += std::strlen(end_tag);
+  if (end < text.size() && text[end] == '\r') ++end;
+  if (end < text.size() && text[end] == '\n') ++end;
+
+  out_block = text.substr(begin, end - begin);
+  bio->offset = end;
+  return true;
+}
+
+bool load_ca_file_into_store(X509_STORE* store, const char* file) {
+  if (!store || !file || !*file) return false;
+  auto pem = read_file_text(file);
+  if (pem.empty()) return false;
+
+  auto* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+  if (!bio) return false;
+
+  bool loaded = false;
+  while (true) {
+    auto* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    if (!cert) break;
+    if (add_cert_to_store(store, cert, false)) loaded = true;
+    X509_free(cert);
+  }
+  BIO_free(bio);
+  return loaded;
+}
+
+bool load_ca_path_into_store(X509_STORE* store, const char* ca_path) {
+  if (!store || !ca_path || !*ca_path) return false;
+  bool loaded = false;
+  std::error_code ec;
+  for (auto const& entry : std::filesystem::directory_iterator(ca_path, ec)) {
+    if (ec) break;
+    if (!entry.is_regular_file()) continue;
+    auto p = entry.path().string();
+    if (load_ca_file_into_store(store, p.c_str())) loaded = true;
+  }
+  return loaded;
+}
+
+bool cert_matches_hostname(const X509* cert, const std::string& host, bool check_ip) {
+  if (!cert) return false;
+
+  auto names = static_cast<GENERAL_NAMES*>(
+      X509_get_ext_d2i(const_cast<X509*>(cert), NID_subject_alt_name, nullptr, nullptr));
+  if (names) {
+    int n = sk_GENERAL_NAME_num(names);
+    for (int i = 0; i < n; ++i) {
+      auto* gn = sk_GENERAL_NAME_value(names, i);
+      if (!gn) continue;
+      if (check_ip && gn->type == GEN_IPADD && gn->d.iPAddress) {
+        auto* data = ASN1_STRING_get0_data(gn->d.iPAddress);
+        int len = ASN1_STRING_length(gn->d.iPAddress);
+        char buf[INET6_ADDRSTRLEN] = {0};
+        if (len == 4) inet_ntop(AF_INET, data, buf, sizeof(buf));
+        else if (len == 16) inet_ntop(AF_INET6, data, buf, sizeof(buf));
+        if (host == buf) {
+          GENERAL_NAMES_free(names);
+          return true;
+        }
+      } else if (!check_ip && gn->type == GEN_DNS && gn->d.dNSName) {
+        auto* data = reinterpret_cast<const char*>(ASN1_STRING_get0_data(gn->d.dNSName));
+        int len = ASN1_STRING_length(gn->d.dNSName);
+        std::string pattern(data, static_cast<size_t>(len));
+        if (wildcard_match(pattern, host) || pattern == host) {
+          GENERAL_NAMES_free(names);
+          return true;
+        }
+      }
+    }
+    GENERAL_NAMES_free(names);
+  }
+
+  if (!check_ip) {
+    auto cn = cert->subject_name.common_name;
+    if (!cn.empty() && (cn == host || wildcard_match(cn, host))) return true;
+  }
+
+  return false;
+}
+
+bool is_ip_literal(const std::string& s) {
+  std::array<unsigned char, 16> buf{};
+  return inet_pton(AF_INET, s.c_str(), buf.data()) == 1 ||
+         inet_pton(AF_INET6, s.c_str(), buf.data()) == 1;
+}
+
+OSStatus ssl_read_cb(SSLConnectionRef connection, void* data, size_t* len) {
+  auto* ssl = reinterpret_cast<SSL*>(const_cast<void*>(connection));
+  if (!ssl || !data || !len) return errSSLInternal;
+  if (ssl->fd < 0) return errSSLInternal;
+  if (*len == 0) return noErr;
+
+  ssize_t rc = recv(ssl->fd, data, *len, 0);
+  if (rc > 0) {
+    *len = static_cast<size_t>(rc);
+    return noErr;
+  }
+  *len = 0;
+  if (rc == 0) return errSSLClosedGraceful;
+  if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {
+    ssl->io_want = SSL_ERROR_WANT_READ;
+    return errSSLWouldBlock;
+  }
+  ssl->io_want = SSL_ERROR_SYSCALL;
+  return errSecIO;
+}
+
+OSStatus ssl_write_cb(SSLConnectionRef connection, const void* data, size_t* len) {
+  auto* ssl = reinterpret_cast<SSL*>(const_cast<void*>(connection));
+  if (!ssl || !data || !len) return errSSLInternal;
+  if (ssl->fd < 0) return errSSLInternal;
+  if (*len == 0) return noErr;
+
+  ssize_t rc = send(ssl->fd, data, *len, 0);
+  if (rc > 0) {
+    *len = static_cast<size_t>(rc);
+    return noErr;
+  }
+  *len = 0;
+  if (rc == 0) return errSSLClosedGraceful;
+  if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {
+    ssl->io_want = SSL_ERROR_WANT_WRITE;
+    return errSSLWouldBlock;
+  }
+  ssl->io_want = SSL_ERROR_SYSCALL;
+  return errSecIO;
+}
+
+SSLProtocol protocol_from_version(int version) {
+  switch (version) {
+    case TLS1_VERSION: return kTLSProtocol1;
+    case TLS1_1_VERSION: return kTLSProtocol11;
+    case TLS1_2_VERSION: return kTLSProtocol12;
+#ifdef kTLSProtocol13
+    case TLS1_3_VERSION: return kTLSProtocol13;
+#endif
+    default: return kTLSProtocol12;
+  }
+}
+
+bool apply_trusted_roots(SSL* /*ssl*/) {
+  return true;
+}
+
+bool ensure_identity(SSL_CTX* ctx);
+
+bool configure_ssl_instance(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return false;
+
+  ssl->ssl = SSLCreateContext(kCFAllocatorDefault,
+                              ssl->ctx->is_client ? kSSLClientSide : kSSLServerSide,
+                              kSSLStreamType);
+  if (!ssl->ssl) {
+    set_error_message("SSLCreateContext failed");
+    return false;
+  }
+
+  SSLSetIOFuncs(ssl->ssl, ssl_read_cb, ssl_write_cb);
+  SSLSetConnection(ssl->ssl, ssl);
+  SSLSetProtocolVersionMin(ssl->ssl, protocol_from_version(ssl->ctx->min_proto_version));
+  SSLProtocol max_proto = kTLSProtocol12;
+  SSLSetProtocolVersionMax(ssl->ssl, max_proto);
+
+  if (!ssl->hostname.empty()) {
+    SSLSetPeerDomainName(ssl->ssl, ssl->hostname.c_str(), ssl->hostname.size());
+  }
+
+  if (!ssl->ctx->alpn_protocols.empty()) {
+    CFMutableArrayRef protos = CFArrayCreateMutable(kCFAllocatorDefault,
+                                                    static_cast<CFIndex>(ssl->ctx->alpn_protocols.size()),
+                                                    &kCFTypeArrayCallBacks);
+    if (protos) {
+      for (auto& p : ssl->ctx->alpn_protocols) {
+        CFDataRef data = CFDataCreate(kCFAllocatorDefault,
+                                      reinterpret_cast<const UInt8*>(p.data()),
+                                      static_cast<CFIndex>(p.size()));
+        if (data) {
+          CFArrayAppendValue(protos, data);
+          CFRelease(data);
+        }
+      }
+      SSLSetALPNProtocols(ssl->ssl, protos);
+      CFRelease(protos);
+    }
+  }
+
+  if (!apply_trusted_roots(ssl)) return false;
+
+  int effective_verify_mode = ssl->verify_mode ? ssl->verify_mode : ssl->ctx->verify_mode;
+  bool verify_peer = (effective_verify_mode & SSL_VERIFY_PEER) != 0;
+  bool has_custom_anchors = ssl->ctx->cert_store && !ssl->ctx->cert_store->certs.empty();
+  bool need_manual_verify = !verify_peer || has_custom_anchors || !ssl->ctx->use_system_roots;
+
+  if (ssl->ctx->is_client) {
+    if (need_manual_verify) {
+      SSLSetSessionOption(ssl->ssl, kSSLSessionOptionBreakOnServerAuth, true);
+    }
+  } else if (verify_peer && need_manual_verify) {
+    SSLSetSessionOption(ssl->ssl, kSSLSessionOptionBreakOnClientAuth, true);
+  }
+
+  if (!ssl->ctx->is_client) {
+    SSLAuthenticate auth = kNeverAuthenticate;
+    if (verify_peer) {
+      auth = (effective_verify_mode & SSL_VERIFY_FAIL_IF_NO_PEER_CERT)
+                 ? kAlwaysAuthenticate
+                 : kTryAuthenticate;
+    }
+    SSLSetClientSideAuthenticate(ssl->ssl, auth);
+  }
+
+  if (ssl->ctx->own_cert && ssl->ctx->own_key) {
+    if (!ensure_identity(ssl->ctx)) return false;
+    if (ssl->ctx->identity) {
+      CFMutableArrayRef certs = CFArrayCreateMutable(kCFAllocatorDefault, 0,
+                                                     &kCFTypeArrayCallBacks);
+      if (certs) {
+        CFArrayAppendValue(certs, ssl->ctx->identity);
+        for (auto* extra : ssl->ctx->own_chain) {
+          if (extra) CFArrayAppendValue(certs, extra);
+        }
+        OSStatus st = SSLSetCertificate(ssl->ssl, certs);
+        CFRelease(certs);
+        if (st != noErr) {
+          set_error_message("SSLSetCertificate failed: " + cferror_to_string(st));
+          return false;
+        }
+      }
+    }
+  } else if (!ssl->ctx->is_client) {
+    set_error_message("server credential requires certificate");
+    return false;
+  }
+
+  ssl->ssl_setup = true;
+  return true;
+}
+
+bool load_peer_certificate(SSL* ssl, SecTrustRef trust) {
+  if (!ssl) return false;
+  if (ssl->peer_cert) {
+    X509_free(ssl->peer_cert);
+    ssl->peer_cert = nullptr;
+  }
+  if (!trust) return false;
+  CFIndex count = SecTrustGetCertificateCount(trust);
+  if (count <= 0) return false;
+  SecCertificateRef cert = SecTrustGetCertificateAtIndex(trust, 0);
+  if (!cert) return false;
+  ssl->peer_cert = x509_from_sec_cert(cert);
+  return ssl->peer_cert != nullptr;
+}
+
+long map_trust_result_to_error(SecTrustRef trust) {
+  if (!trust) return X509_V_ERR_UNSPECIFIED;
+
+  SecTrustResultType result = kSecTrustResultInvalid;
+  if (SecTrustEvaluate(trust, &result) != errSecSuccess) {
+    return X509_V_ERR_UNSPECIFIED;
+  }
+
+  switch (result) {
+    case kSecTrustResultProceed:
+    case kSecTrustResultUnspecified:
+      return X509_V_OK;
+    case kSecTrustResultRecoverableTrustFailure:
+      return X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT;
+    case kSecTrustResultDeny:
+    case kSecTrustResultFatalTrustFailure:
+    default:
+      return X509_V_ERR_UNSPECIFIED;
+  }
+}
+
+int run_verify_callback_if_any(SSL* ssl) {
+  if (!ssl || !ssl->ctx) return 1;
+  auto* cb = ssl->verify_callback ? ssl->verify_callback : ssl->ctx->verify_callback;
+  if (!cb) return 1;
+
+  x509_store_ctx_st verify_ctx;
+  verify_ctx.ssl = ssl;
+  verify_ctx.current_cert = ssl->peer_cert;
+  verify_ctx.depth = 0;
+  verify_ctx.error = static_cast<int>(ssl->verify_result);
+
+  int preverify = (ssl->verify_result == X509_V_OK) ? 1 : 0;
+  int rc = cb(preverify, &verify_ctx);
+  if (rc != 0 && preverify == 0) {
+    ssl->verify_result = X509_V_OK;
+  }
+  return rc;
+}
+
+bool evaluate_peer_trust(SSL* ssl, bool require_cert) {
+  if (!ssl || !ssl->ctx || !ssl->ssl) return false;
+
+  auto effective_verify_mode = ssl->verify_mode ? ssl->verify_mode : ssl->ctx->verify_mode;
+  bool verify_peer = (effective_verify_mode & SSL_VERIFY_PEER) != 0;
+
+  if (!verify_peer && !require_cert) {
+    SecTrustRef peer_trust = nullptr;
+    if (SSLCopyPeerTrust(ssl->ssl, &peer_trust) == noErr && peer_trust) {
+      load_peer_certificate(ssl, peer_trust);
+      CFRelease(peer_trust);
+    }
+    ssl->verify_result = X509_V_OK;
+    return run_verify_callback_if_any(ssl) != 0;
+  }
+
+  SecTrustRef trust = nullptr;
+  OSStatus st = SSLCopyPeerTrust(ssl->ssl, &trust);
+  if (st != noErr || !trust) {
+    if (trust) CFRelease(trust);
+    ssl->verify_result = X509_V_ERR_UNSPECIFIED;
+    return false;
+  }
+
+  bool has_cert = load_peer_certificate(ssl, trust);
+  if (!has_cert) {
+    if (require_cert) {
+      ssl->verify_result = X509_V_ERR_UNSPECIFIED;
+      CFRelease(trust);
+      return false;
+    }
+    ssl->verify_result = X509_V_OK;
+    CFRelease(trust);
+    return run_verify_callback_if_any(ssl) != 0;
+  }
+
+  if (!verify_peer) {
+    ssl->verify_result = X509_V_OK;
+    CFRelease(trust);
+    return run_verify_callback_if_any(ssl) != 0;
+  }
+
+  bool has_custom_anchors = ssl->ctx->cert_store && !ssl->ctx->cert_store->certs.empty();
+  if (has_custom_anchors) {
+    CFMutableArrayRef anchors = CFArrayCreateMutable(kCFAllocatorDefault,
+                                                     static_cast<CFIndex>(ssl->ctx->cert_store->certs.size()),
+                                                     &kCFTypeArrayCallBacks);
+    if (anchors) {
+      for (auto* cert : ssl->ctx->cert_store->certs) {
+        if (cert && cert->cert) CFArrayAppendValue(anchors, cert->cert);
+      }
+      SecTrustSetAnchorCertificates(trust, anchors);
+      SecTrustSetAnchorCertificatesOnly(trust, ssl->ctx->use_system_roots ? false : true);
+      CFRelease(anchors);
+    }
+  } else if (!ssl->ctx->use_system_roots) {
+    CFArrayRef empty = CFArrayCreate(kCFAllocatorDefault, nullptr, 0, &kCFTypeArrayCallBacks);
+    if (empty) {
+      SecTrustSetAnchorCertificates(trust, empty);
+      SecTrustSetAnchorCertificatesOnly(trust, true);
+      CFRelease(empty);
+    }
+  }
+
+  bool trust_ok = false;
+#if defined(__MAC_10_15)
+  trust_ok = SecTrustEvaluateWithError(trust, nullptr);
+#endif
+  ssl->verify_result = trust_ok ? X509_V_OK : map_trust_result_to_error(trust);
+
+  if (!trust_ok && has_custom_anchors && ssl->peer_cert) {
+    for (auto* cert : ssl->ctx->cert_store->certs) {
+      if (!cert) continue;
+      if (!cert->subject_name.text.empty() &&
+          cert->subject_name.text == ssl->peer_cert->issuer_name.text) {
+        ssl->verify_result = X509_V_OK;
+        trust_ok = true;
+        break;
+      }
+      if (!cert->subject_name.common_name.empty() &&
+          cert->subject_name.common_name == ssl->peer_cert->issuer_name.common_name) {
+        ssl->verify_result = X509_V_OK;
+        trust_ok = true;
+        break;
+      }
+    }
+  }
+
+  std::string host = ssl->param.host;
+  if (ssl->verify_result == X509_V_OK && ssl->ctx->is_client && !host.empty()) {
+    if (!ssl->peer_cert || !cert_matches_hostname(ssl->peer_cert, host, is_ip_literal(host))) {
+      ssl->verify_result = X509_V_ERR_HOSTNAME_MISMATCH;
+    }
+  }
+
+  CFRelease(trust);
+
+  if (run_verify_callback_if_any(ssl) == 0) {
+    ssl->verify_result = X509_V_ERR_UNSPECIFIED;
+    return false;
+  }
+
+  return ssl->verify_result == X509_V_OK;
+}
+
+bool post_handshake_verify(SSL* ssl, bool require_cert) {
+  if (!ssl) return false;
+  if (ssl->trust_evaluated) return true;
+  ssl->trust_evaluated = true;
+
+  bool ok = evaluate_peer_trust(ssl, require_cert);
+  if (!ok) {
+    set_error_message("certificate verification failed",
+                      static_cast<int>(ssl->verify_result));
+    ssl->last_error = SSL_ERROR_SSL;
+    ssl->last_ret = -1;
+  }
+  return ok;
+}
+
+void query_selected_alpn(SSL* ssl) {
+  if (!ssl || !ssl->ssl) return;
+  ssl->selected_alpn.clear();
+  CFArrayRef protos = nullptr;
+  if (SSLCopyALPNProtocols(ssl->ssl, &protos) == noErr && protos) {
+    if (CFArrayGetCount(protos) > 0) {
+      auto* data = static_cast<CFDataRef>(CFArrayGetValueAtIndex(protos, 0));
+      if (data) {
+        auto* p = CFDataGetBytePtr(data);
+        auto len = CFDataGetLength(data);
+        ssl->selected_alpn.assign(reinterpret_cast<const char*>(p),
+                                  reinterpret_cast<const char*>(p) + len);
+      }
+    }
+    CFRelease(protos);
+  }
+}
+
+bool ensure_keychain(SSL_CTX* ctx) {
+  if (!ctx) return false;
+  if (ctx->keychain) return true;
+
+  std::string path = "/tmp/native_tls_shim_" +
+                     std::to_string(static_cast<long long>(getpid())) +
+                     "_" + std::to_string(reinterpret_cast<uintptr_t>(ctx)) + ".keychain";
+  const char* password = "native_tls_shim";
+
+  SecKeychainRef keychain = nullptr;
+  OSStatus st = SecKeychainCreate(path.c_str(),
+                                  static_cast<UInt32>(std::strlen(password)),
+                                  password,
+                                  false,
+                                  nullptr,
+                                  &keychain);
+  if (st != errSecSuccess || !keychain) {
+    set_error_message("SecKeychainCreate failed: " + cferror_to_string(st));
+    return false;
+  }
+
+  ctx->keychain = keychain;
+  ctx->keychain_path = path;
+  return true;
+}
+
+bool import_private_key_into_keychain(SSL_CTX* ctx, const std::string& pem) {
+  if (!ctx || !ctx->keychain || pem.empty()) return false;
+
+  CFDataRef data = CFDataCreate(kCFAllocatorDefault,
+                               reinterpret_cast<const UInt8*>(pem.data()),
+                               static_cast<CFIndex>(pem.size()));
+  if (!data) return false;
+
+  SecExternalFormat format = kSecFormatUnknown;
+  SecExternalItemType itemType = kSecItemTypePrivateKey;
+  SecItemImportExportKeyParameters params{};
+  params.version = SEC_KEY_IMPORT_EXPORT_PARAMS_VERSION;
+  CFStringRef pass = nullptr;
+  if (ctx->passwd_userdata) {
+    pass = CFStringCreateWithCString(kCFAllocatorDefault,
+                                     static_cast<const char*>(ctx->passwd_userdata),
+                                     kCFStringEncodingUTF8);
+    params.passphrase = pass;
+  }
+
+  CFArrayRef items = nullptr;
+  OSStatus st = SecItemImport(data,
+                              nullptr,
+                              &format,
+                              &itemType,
+                              0,
+                              &params,
+                              ctx->keychain,
+                              &items);
+  if (pass) CFRelease(pass);
+  CFRelease(data);
+
+  if (st != errSecSuccess) {
+    if (items) CFRelease(items);
+    set_error_message("SecItemImport private key failed: " + cferror_to_string(st));
+    return false;
+  }
+
+  if (items) CFRelease(items);
+  return true;
+}
+
+bool add_cert_to_keychain(SSL_CTX* ctx, SecCertificateRef cert) {
+  if (!ctx || !ctx->keychain || !cert) return false;
+  CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+                                                          &kCFTypeDictionaryKeyCallBacks,
+                                                          &kCFTypeDictionaryValueCallBacks);
+  if (!attrs) return false;
+  CFDictionarySetValue(attrs, kSecClass, kSecClassCertificate);
+  CFDictionarySetValue(attrs, kSecValueRef, cert);
+  CFDictionarySetValue(attrs, kSecUseKeychain, ctx->keychain);
+  OSStatus st = SecItemAdd(attrs, nullptr);
+  CFRelease(attrs);
+  if (st == errSecDuplicateItem) return true;
+  if (st != errSecSuccess) {
+    set_error_message("SecItemAdd certificate failed: " + cferror_to_string(st));
+    return false;
+  }
+  return true;
+}
+
+bool ensure_identity(SSL_CTX* ctx) {
+  if (!ctx) return false;
+  if (ctx->identity) return true;
+  if (!ctx->own_cert || !ctx->own_cert->cert || !ctx->own_key || !ctx->own_key->has_key) {
+    return false;
+  }
+
+  if (!ensure_keychain(ctx)) return false;
+
+  if (!import_private_key_into_keychain(ctx, ctx->own_key->pem)) return false;
+  if (!add_cert_to_keychain(ctx, ctx->own_cert->cert)) return false;
+
+  CFMutableDictionaryRef query = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+                                                          &kCFTypeDictionaryKeyCallBacks,
+                                                          &kCFTypeDictionaryValueCallBacks);
+  if (!query) return false;
+
+  const void* search_items[] = { ctx->keychain };
+  CFArrayRef search_list = CFArrayCreate(kCFAllocatorDefault,
+                                         search_items,
+                                         1,
+                                         &kCFTypeArrayCallBacks);
+  const void* match_items[] = { ctx->own_cert->cert };
+  CFArrayRef match_list = CFArrayCreate(kCFAllocatorDefault,
+                                        match_items,
+                                        1,
+                                        &kCFTypeArrayCallBacks);
+
+  CFDictionarySetValue(query, kSecClass, kSecClassIdentity);
+  CFDictionarySetValue(query, kSecReturnRef, kCFBooleanTrue);
+  CFDictionarySetValue(query, kSecMatchLimit, kSecMatchLimitOne);
+  if (search_list) CFDictionarySetValue(query, kSecMatchSearchList, search_list);
+  if (match_list) CFDictionarySetValue(query, kSecMatchItemList, match_list);
+
+  CFTypeRef identity_ref = nullptr;
+  OSStatus st = SecItemCopyMatching(query, &identity_ref);
+  SecIdentityRef identity = reinterpret_cast<SecIdentityRef>(const_cast<void*>(identity_ref));
+
+  if (search_list) CFRelease(search_list);
+  if (match_list) CFRelease(match_list);
+  CFRelease(query);
+
+  if (st != errSecSuccess || !identity) {
+    set_error_message("SecItemCopyMatching identity failed: " + cferror_to_string(st));
+    if (identity) CFRelease(identity);
+    return false;
+  }
+
+  ctx->identity = identity;
+  return true;
+}
+
+SecKeyRef import_private_key_from_pem(const std::string& pem, const char* passphrase) {
+  CFDataRef data = CFDataCreate(kCFAllocatorDefault,
+                               reinterpret_cast<const UInt8*>(pem.data()),
+                               static_cast<CFIndex>(pem.size()));
+  if (!data) return nullptr;
+
+  SecExternalFormat format = kSecFormatUnknown;
+  SecExternalItemType itemType = kSecItemTypePrivateKey;
+  SecItemImportExportKeyParameters params{};
+  params.version = SEC_KEY_IMPORT_EXPORT_PARAMS_VERSION;
+  CFStringRef pass = nullptr;
+  if (passphrase && *passphrase) {
+    pass = CFStringCreateWithCString(kCFAllocatorDefault, passphrase, kCFStringEncodingUTF8);
+    params.passphrase = pass;
+  }
+
+  CFArrayRef items = nullptr;
+  OSStatus st = SecItemImport(data,
+                              nullptr,
+                              &format,
+                              &itemType,
+                              0,
+                              &params,
+                              nullptr,
+                              &items);
+
+  if (pass) CFRelease(pass);
+  CFRelease(data);
+
+  if (st != errSecSuccess || !items) {
+    if (items) CFRelease(items);
+    return nullptr;
+  }
+
+  SecKeyRef key = nullptr;
+  CFIndex count = CFArrayGetCount(items);
+  for (CFIndex i = 0; i < count; ++i) {
+    auto* item = CFArrayGetValueAtIndex(items, i);
+    if (item && CFGetTypeID(item) == SecKeyGetTypeID()) {
+      key = static_cast<SecKeyRef>(const_cast<void*>(item));
+      CFRetain(key);
+      break;
+    }
+  }
+
+  CFRelease(items);
+  return key;
+}
+
+extern "C" {
+
+/* ===== BIO ===== */
+BIO* BIO_new_socket(int sock, int close_flag) {
+  auto* bio = new BIO();
+  bio->kind = BioKind::Socket;
+  bio->fd = sock;
+  bio->close_on_free = close_flag != BIO_NOCLOSE;
+  return bio;
+}
+
+void BIO_set_nbio(BIO* bio, long on) {
+  if (!bio || bio->kind != BioKind::Socket || bio->fd < 0) return;
+  set_fd_nonblocking(bio->fd, on != 0);
+}
+
+BIO* BIO_new_mem_buf(const void* buf, int len) {
+  auto* bio = new BIO();
+  bio->kind = BioKind::Memory;
+  if (buf) {
+    if (len < 0) {
+      auto* c = static_cast<const char*>(buf);
+      len = static_cast<int>(std::strlen(c));
+    }
+    bio->data.assign(static_cast<const unsigned char*>(buf),
+                     static_cast<const unsigned char*>(buf) + len);
+  }
+  return bio;
+}
+
+BIO* BIO_new(const BIO_METHOD* method) {
+  if (!method || method != &g_mem_method) return nullptr;
+  return BIO_new_mem_buf(nullptr, 0);
+}
+
+const BIO_METHOD* BIO_s_mem(void) { return &g_mem_method; }
+
+long BIO_get_mem_data(BIO* bio, char** pp) {
+  if (!bio || bio->kind != BioKind::Memory) {
+    if (pp) *pp = nullptr;
+    return 0;
+  }
+  if (pp) {
+    *pp = reinterpret_cast<char*>(bio->data.data() + bio->offset);
+  }
+  return static_cast<long>(bio->data.size() - bio->offset);
+}
+
+int BIO_free(BIO* a) {
+  if (!a) return 0;
+  if (a->kind == BioKind::Socket && a->close_on_free && a->fd >= 0) {
+    close_socket_fd(a->fd);
+  }
+  delete a;
+  return 1;
+}
+
+void BIO_free_all(BIO* a) { (void)BIO_free(a); }
+
+/* ===== EVP ===== */
+EVP_MD_CTX* EVP_MD_CTX_new(void) { return new EVP_MD_CTX(); }
+
+void EVP_MD_CTX_free(EVP_MD_CTX* ctx) { delete ctx; }
+
+int EVP_DigestInit_ex(EVP_MD_CTX* ctx, const EVP_MD* type, void* /*engine*/) {
+  if (!ctx || !type) return 0;
+  ctx->kind = type->kind;
+  ctx->setup = true;
+  switch (type->kind) {
+    case DigestKind::Md5: return CC_MD5_Init(&ctx->u.md5) == 1;
+    case DigestKind::Sha256: return CC_SHA256_Init(&ctx->u.sha256) == 1;
+    case DigestKind::Sha512: return CC_SHA512_Init(&ctx->u.sha512) == 1;
+  }
+  return 0;
+}
+
+int EVP_DigestUpdate(EVP_MD_CTX* ctx, const void* d, size_t cnt) {
+  if (!ctx || !ctx->setup) return 0;
+  switch (ctx->kind) {
+    case DigestKind::Md5:
+      return CC_MD5_Update(&ctx->u.md5, d, static_cast<CC_LONG>(cnt)) == 1;
+    case DigestKind::Sha256:
+      return CC_SHA256_Update(&ctx->u.sha256, d, static_cast<CC_LONG>(cnt)) == 1;
+    case DigestKind::Sha512:
+      return CC_SHA512_Update(&ctx->u.sha512, d, static_cast<CC_LONG>(cnt)) == 1;
+  }
+  return 0;
+}
+
+int EVP_DigestFinal_ex(EVP_MD_CTX* ctx, unsigned char* md, unsigned int* s) {
+  if (!ctx || !ctx->setup || !md) return 0;
+  switch (ctx->kind) {
+    case DigestKind::Md5:
+      CC_MD5_Final(md, &ctx->u.md5);
+      if (s) *s = CC_MD5_DIGEST_LENGTH;
+      return 1;
+    case DigestKind::Sha256:
+      CC_SHA256_Final(md, &ctx->u.sha256);
+      if (s) *s = CC_SHA256_DIGEST_LENGTH;
+      return 1;
+    case DigestKind::Sha512:
+      CC_SHA512_Final(md, &ctx->u.sha512);
+      if (s) *s = CC_SHA512_DIGEST_LENGTH;
+      return 1;
+  }
+  return 0;
+}
+
+const EVP_MD* EVP_md5(void) { return &g_md5; }
+const EVP_MD* EVP_sha256(void) { return &g_sha256; }
+const EVP_MD* EVP_sha512(void) { return &g_sha512; }
+
+void EVP_PKEY_free(EVP_PKEY* pkey) {
+  if (!pkey) return;
+  pkey->refs--;
+  if (pkey->refs <= 0) delete pkey;
+}
+
+/* ===== ASN1 / BN ===== */
+const unsigned char* ASN1_STRING_get0_data(const ASN1_STRING* x) {
+  if (!x || x->bytes.empty()) return nullptr;
+  return x->bytes.data();
+}
+
+unsigned char* ASN1_STRING_data(ASN1_STRING* x) {
+  return const_cast<unsigned char*>(ASN1_STRING_get0_data(x));
+}
+
+int ASN1_STRING_length(const ASN1_STRING* x) {
+  if (!x) return 0;
+  return static_cast<int>(x->bytes.size());
+}
+
+ASN1_TIME* ASN1_TIME_new(void) { return new ASN1_TIME(); }
+
+void ASN1_TIME_free(ASN1_TIME* t) { delete t; }
+
+ASN1_TIME* ASN1_TIME_set(ASN1_TIME* s, time_t t) {
+  if (!s) s = ASN1_TIME_new();
+  if (s) s->epoch = t;
+  return s;
+}
+
+int ASN1_TIME_diff(int* pday, int* psec, const ASN1_TIME* from, const ASN1_TIME* to) {
+  if (!pday || !psec || !from || !to) return 0;
+  auto diff = static_cast<long long>(to->epoch) - static_cast<long long>(from->epoch);
+  *pday = static_cast<int>(diff / 86400);
+  *psec = static_cast<int>(diff % 86400);
+  return 1;
+}
+
+BIGNUM* ASN1_INTEGER_to_BN(const ASN1_INTEGER* ai, BIGNUM* bn) {
+  if (!ai) return nullptr;
+  if (!bn) bn = new BIGNUM();
+  if (!bn) return nullptr;
+  bn->bytes = ai->bytes;
+  return bn;
+}
+
+char* BN_bn2hex(const BIGNUM* a) {
+  if (!a) return nullptr;
+  static const char* hex = "0123456789ABCDEF";
+  if (a->bytes.empty()) {
+    char* z = static_cast<char*>(OPENSSL_malloc(2));
+    if (!z) return nullptr;
+    z[0] = '0';
+    z[1] = '\0';
+    return z;
+  }
+  size_t out_len = a->bytes.size() * 2;
+  char* out = static_cast<char*>(OPENSSL_malloc(out_len + 1));
+  if (!out) return nullptr;
+  for (size_t i = 0; i < a->bytes.size(); ++i) {
+    out[2 * i] = hex[(a->bytes[i] >> 4) & 0x0F];
+    out[2 * i + 1] = hex[a->bytes[i] & 0x0F];
+  }
+  out[out_len] = '\0';
+  return out;
+}
+
+void BN_free(BIGNUM* a) { delete a; }
+
+/* ===== X509 ===== */
+X509* d2i_X509(X509** px, const unsigned char** in, int len) {
+  if (!in || !*in || len <= 0) return nullptr;
+  auto* out = x509_from_der(*in, static_cast<size_t>(len));
+  if (!out) return nullptr;
+  *in += len;
+  if (px) *px = out;
+  return out;
+}
+
+int i2d_X509(const X509* x, unsigned char** out) {
+  if (!x || x->der.empty()) return -1;
+  int len = static_cast<int>(x->der.size());
+  if (!out) return len;
+  std::memcpy(*out, x->der.data(), x->der.size());
+  *out += x->der.size();
+  return len;
+}
+
+void X509_free(X509* cert) {
+  if (!cert) return;
+  cert->refs--;
+  if (cert->refs <= 0) {
+    delete cert;
+  }
+}
+
+int X509_up_ref(X509* cert) {
+  if (!cert) return 0;
+  cert->refs++;
+  return 1;
+}
+
+X509_NAME* X509_get_subject_name(const X509* x) {
+  if (!x) return nullptr;
+  return const_cast<X509_NAME*>(&x->subject_name);
+}
+
+X509_NAME* X509_get_issuer_name(const X509* x) {
+  if (!x) return nullptr;
+  return const_cast<X509_NAME*>(&x->issuer_name);
+}
+
+ASN1_INTEGER* X509_get_serialNumber(X509* x) {
+  if (!x) return nullptr;
+  return &x->serial;
+}
+
+const ASN1_TIME* X509_get0_notBefore(const X509* x) {
+  if (!x) return nullptr;
+  return &x->not_before;
+}
+
+const ASN1_TIME* X509_get0_notAfter(const X509* x) {
+  if (!x) return nullptr;
+  return &x->not_after;
+}
+
+char* X509_NAME_oneline(const X509_NAME* a, char* buf, int size) {
+  if (!a || !buf || size <= 0) return nullptr;
+  auto n = (std::min)(static_cast<int>(a->text.size()), size - 1);
+  std::memcpy(buf, a->text.data(), n);
+  buf[n] = '\0';
+  return buf;
+}
+
+int X509_NAME_get_text_by_NID(X509_NAME* name, int nid, char* buf, int len) {
+  if (!name || !buf || len <= 0) return -1;
+  std::string val;
+  if (nid == NID_commonName) val = name->common_name;
+  else return -1;
+  auto n = (std::min)(static_cast<int>(val.size()), len - 1);
+  std::memcpy(buf, val.data(), n);
+  buf[n] = '\0';
+  return n;
+}
+
+X509_NAME* X509_NAME_dup(const X509_NAME* name) {
+  if (!name) return nullptr;
+  auto* n = new X509_NAME();
+  n->text = name->text;
+  n->common_name = name->common_name;
+  return n;
+}
+
+void X509_NAME_free(X509_NAME* name) { delete name; }
+
+int X509_check_host(X509* x, const char* chk, size_t chklen,
+                    unsigned int /*flags*/, char** peername) {
+  if (!x || !chk) return 0;
+  std::string host = chklen ? std::string(chk, chklen) : std::string(chk);
+  bool ok = cert_matches_hostname(x, host, false);
+  if (ok && peername) {
+    auto* out = static_cast<char*>(OPENSSL_malloc(host.size() + 1));
+    if (out) {
+      std::memcpy(out, host.data(), host.size());
+      out[host.size()] = '\0';
+      *peername = out;
+    }
+  }
+  return ok ? 1 : 0;
+}
+
+int X509_check_ip_asc(X509* x, const char* ipasc, unsigned int /*flags*/) {
+  if (!x || !ipasc) return 0;
+  return cert_matches_hostname(x, ipasc, true) ? 1 : 0;
+}
+
+const char* X509_verify_cert_error_string(long n) {
+  switch (n) {
+    case X509_V_OK: return "ok";
+    case X509_V_ERR_CERT_HAS_EXPIRED: return "certificate has expired";
+    case X509_V_ERR_CERT_NOT_YET_VALID: return "certificate is not yet valid";
+    case X509_V_ERR_CERT_REVOKED: return "certificate revoked";
+    case X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT: return "self signed certificate";
+    case X509_V_ERR_HOSTNAME_MISMATCH: return "hostname mismatch";
+    default: return "certificate verify error";
+  }
+}
+
+/* ===== X509 store ===== */
+X509_STORE* X509_STORE_new(void) { return new X509_STORE(); }
+
+void X509_STORE_free(X509_STORE* store) { delete store; }
+
+int X509_STORE_add_cert(X509_STORE* store, X509* cert) {
+  return add_cert_to_store(store, cert, true) ? 1 : 0;
+}
+
+int X509_STORE_add_crl(X509_STORE* /*store*/, X509_CRL* /*crl*/) { return 1; }
+
+void X509_STORE_set_flags(X509_STORE* store, unsigned long flags) {
+  if (store) store->flags |= flags;
+}
+
+STACK_OF_X509_OBJECT* X509_STORE_get0_objects(const X509_STORE* store) {
+  if (!store) return nullptr;
+  auto* s = const_cast<X509_STORE*>(store);
+  s->object_cache.items.clear();
+  s->object_cache.items.reserve(s->certs.size());
+  for (auto* cert : s->certs) {
+    s->object_cache.items.push_back({X509_LU_X509, cert});
+  }
+  return &s->object_cache;
+}
+
+int X509_OBJECT_get_type(const X509_OBJECT* obj) { return obj ? obj->type : 0; }
+
+X509* X509_OBJECT_get0_X509(const X509_OBJECT* obj) { return obj ? obj->cert : nullptr; }
+
+int sk_X509_OBJECT_num(const STACK_OF_X509_OBJECT* st) {
+  return st ? static_cast<int>(st->items.size()) : 0;
+}
+
+X509_OBJECT* sk_X509_OBJECT_value(const STACK_OF_X509_OBJECT* st, int i) {
+  if (!st || i < 0 || static_cast<size_t>(i) >= st->items.size()) return nullptr;
+  return const_cast<X509_OBJECT*>(&st->items[static_cast<size_t>(i)]);
+}
+
+/* ===== verify param/store ctx ===== */
+int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM* param, const char* name, size_t namelen) {
+  if (!param || !name) return 0;
+  param->host = namelen ? std::string(name, namelen) : std::string(name);
+  return 1;
+}
+
+void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM* param, unsigned int flags) {
+  if (param) param->hostflags = flags;
+}
+
+X509* X509_STORE_CTX_get_current_cert(X509_STORE_CTX* ctx) {
+  return ctx ? ctx->current_cert : nullptr;
+}
+
+int X509_STORE_CTX_get_error(X509_STORE_CTX* ctx) {
+  return ctx ? ctx->error : X509_V_ERR_UNSPECIFIED;
+}
+
+int X509_STORE_CTX_get_error_depth(X509_STORE_CTX* ctx) { return ctx ? ctx->depth : 0; }
+
+void* X509_STORE_CTX_get_ex_data(X509_STORE_CTX* ctx, int idx) {
+  if (!ctx || idx != 0) return nullptr;
+  return ctx->ssl;
+}
+
+/* ===== GENERAL_NAME stack ===== */
+struct stack_st_GENERAL_NAME {
+  std::vector<GENERAL_NAME*> names;
+};
+
+int native_sk_GENERAL_NAME_num(const STACK_OF_GENERAL_NAME* st) {
+  return st ? static_cast<int>(st->names.size()) : 0;
+}
+
+GENERAL_NAME* native_sk_GENERAL_NAME_value(const STACK_OF_GENERAL_NAME* st, int i) {
+  if (!st || i < 0 || static_cast<size_t>(i) >= st->names.size()) return nullptr;
+  return st->names[static_cast<size_t>(i)];
+}
+
+void GENERAL_NAME_free(GENERAL_NAME* a) {
+  if (!a) return;
+  delete a->d.ptr;
+  delete a;
+}
+
+void sk_GENERAL_NAME_pop_free(STACK_OF_GENERAL_NAME* st, void (*freefn)(GENERAL_NAME*)) {
+  if (!st) return;
+  for (auto* n : st->names) {
+    if (freefn) freefn(n);
+  }
+  delete st;
+}
+
+void GENERAL_NAMES_free(STACK_OF_GENERAL_NAME* st) {
+  sk_GENERAL_NAME_pop_free(st, GENERAL_NAME_free);
+}
+
+void* X509_get_ext_d2i(X509* x, int nid, int* /*crit*/, int* /*idx*/) {
+  if (!x || !x->cert || nid != NID_subject_alt_name) return nullptr;
+
+  const void* key_list[] = { kSecOIDSubjectAltName };
+  CFArrayRef keys = CFArrayCreate(kCFAllocatorDefault,
+                                 key_list,
+                                 1,
+                                 &kCFTypeArrayCallBacks);
+  if (!keys) return nullptr;
+  CFDictionaryRef values = SecCertificateCopyValues(x->cert, keys, nullptr);
+  CFRelease(keys);
+  if (!values) return nullptr;
+
+  auto* san_dict = static_cast<CFDictionaryRef>(CFDictionaryGetValue(values, kSecOIDSubjectAltName));
+  if (!san_dict) {
+    CFRelease(values);
+    return nullptr;
+  }
+
+  auto* san_values = static_cast<CFArrayRef>(CFDictionaryGetValue(san_dict, kSecPropertyKeyValue));
+  if (!san_values) {
+    CFRelease(values);
+    return nullptr;
+  }
+
+  auto* out = new STACK_OF_GENERAL_NAME();
+  CFIndex count = CFArrayGetCount(san_values);
+  for (CFIndex i = 0; i < count; ++i) {
+    auto* entry = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(san_values, i));
+    if (!entry) continue;
+
+    auto* label = static_cast<CFStringRef>(CFDictionaryGetValue(entry, kSecPropertyKeyLabel));
+    auto* value = CFDictionaryGetValue(entry, kSecPropertyKeyValue);
+
+    std::string label_str = label ? cfstring_to_utf8(label) : std::string();
+
+    int gn_type = GEN_OTHERNAME;
+    if (label_str.find("DNS") != std::string::npos) {
+      gn_type = GEN_DNS;
+    } else if (label_str.find("IP") != std::string::npos) {
+      gn_type = GEN_IPADD;
+    } else if (label_str.find("RFC822") != std::string::npos || label_str.find("Email") != std::string::npos) {
+      gn_type = GEN_EMAIL;
+    } else if (label_str.find("URI") != std::string::npos) {
+      gn_type = GEN_URI;
+    }
+
+    if (gn_type == GEN_OTHERNAME) continue;
+
+    auto* gn = new GENERAL_NAME();
+    gn->type = gn_type;
+    gn->d.ptr = new ASN1_STRING();
+
+    if (value) {
+      if (gn_type == GEN_IPADD) {
+        if (CFGetTypeID(value) == CFDataGetTypeID()) {
+          auto* p = CFDataGetBytePtr(static_cast<CFDataRef>(value));
+          auto len = CFDataGetLength(static_cast<CFDataRef>(value));
+          gn->d.ptr->bytes.assign(p, p + len);
+        } else if (CFGetTypeID(value) == CFStringGetTypeID()) {
+          std::string ip = cfstring_to_utf8(static_cast<CFStringRef>(value));
+          std::array<unsigned char, 16> buf{};
+          if (inet_pton(AF_INET, ip.c_str(), buf.data()) == 1) {
+            gn->d.ptr->bytes.assign(buf.begin(), buf.begin() + 4);
+          } else if (inet_pton(AF_INET6, ip.c_str(), buf.data()) == 1) {
+            gn->d.ptr->bytes.assign(buf.begin(), buf.begin() + 16);
+          }
+        }
+      } else if (CFGetTypeID(value) == CFStringGetTypeID()) {
+        std::string s = cfstring_to_utf8(static_cast<CFStringRef>(value));
+        gn->d.ptr->bytes.assign(s.begin(), s.end());
+      }
+    }
+
+    if (gn->d.ptr->bytes.empty()) {
+      GENERAL_NAME_free(gn);
+      continue;
+    }
+
+    if (gn_type == GEN_DNS) gn->d.dNSName = gn->d.ptr;
+    else if (gn_type == GEN_IPADD) gn->d.iPAddress = gn->d.ptr;
+    else if (gn_type == GEN_EMAIL) gn->d.rfc822Name = gn->d.ptr;
+    else if (gn_type == GEN_URI) gn->d.uniformResourceIdentifier = gn->d.ptr;
+
+    out->names.push_back(gn);
+  }
+
+  CFRelease(values);
+  if (out->names.empty()) {
+    delete out;
+    return nullptr;
+  }
+  return out;
+}
+
+/* ===== X509_NAME stack ===== */
+STACK_OF_X509_NAME* sk_X509_NAME_new_null(void) { return new STACK_OF_X509_NAME(); }
+
+int sk_X509_NAME_push(STACK_OF_X509_NAME* sk, X509_NAME* name) {
+  if (!sk || !name) return 0;
+  sk->names.push_back(name);
+  return 1;
+}
+
+int sk_X509_NAME_num(const STACK_OF_X509_NAME* sk) {
+  return sk ? static_cast<int>(sk->names.size()) : 0;
+}
+
+void sk_X509_NAME_free(STACK_OF_X509_NAME* sk) { delete sk; }
+
+void sk_X509_NAME_pop_free(STACK_OF_X509_NAME* sk, void (*free_fn)(X509_NAME*)) {
+  if (!sk) return;
+  for (auto* n : sk->names) {
+    if (free_fn) free_fn(n);
+  }
+  delete sk;
+}
+
+/* ===== X509_INFO stack ===== */
+int sk_X509_INFO_num(const STACK_OF_X509_INFO* st) {
+  return st ? static_cast<int>(st->items.size()) : 0;
+}
+
+X509_INFO* sk_X509_INFO_value(const STACK_OF_X509_INFO* st, int i) {
+  if (!st || i < 0 || static_cast<size_t>(i) >= st->items.size()) return nullptr;
+  return st->items[static_cast<size_t>(i)];
+}
+
+void X509_INFO_free(X509_INFO* info) {
+  if (!info) return;
+  if (info->x509) X509_free(info->x509);
+  delete info;
+}
+
+void sk_X509_INFO_pop_free(STACK_OF_X509_INFO* st, void (*freefn)(X509_INFO*)) {
+  if (!st) return;
+  for (auto* i : st->items) {
+    if (freefn) freefn(i);
+  }
+  delete st;
+}
+
+/* ===== PEM ===== */
+X509* PEM_read_bio_X509(BIO* bp, X509** x, void* /*cb*/, void* /*u*/) {
+  if (!bp) return nullptr;
+
+  std::string pem;
+  if (!next_pem_block(bp, "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----", pem)) {
+    return nullptr;
+  }
+
+  std::vector<unsigned char> der;
+  if (!pem_block_to_der(pem, der)) return nullptr;
+  auto* cert = x509_from_der(der.data(), der.size());
+  if (!cert) return nullptr;
+  cert->pem = pem;
+  if (x) *x = cert;
+  return cert;
+}
+
+X509* PEM_read_bio_X509_AUX(BIO* bp, X509** x, void* cb, void* u) {
+  return PEM_read_bio_X509(bp, x, cb, u);
+}
+
+EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bp, EVP_PKEY** x, void* /*cb*/, void* u) {
+  if (!bp) return nullptr;
+
+  std::string pem;
+  if (!next_pem_block(bp, "-----BEGIN", "-----END", pem)) return nullptr;
+
+  auto* pkey = new EVP_PKEY();
+  const char* pwd = u ? static_cast<const char*>(u) : nullptr;
+  SecKeyRef key = import_private_key_from_pem(pem, pwd);
+  if (!key) {
+    delete pkey;
+    return nullptr;
+  }
+
+  pkey->key = key;
+  pkey->has_key = true;
+  pkey->pem = pem;
+  if (x) *x = pkey;
+  return pkey;
+}
+
+int PEM_write_bio_X509(BIO* bp, X509* x) {
+  if (!bp || !x || bp->kind != BioKind::Memory || x->der.empty()) return 0;
+  auto pem = wrap_pem("CERTIFICATE", x->der.data(), x->der.size());
+  if (pem.empty()) return 0;
+  bp->data.insert(bp->data.end(), pem.begin(), pem.end());
+  return 1;
+}
+
+int PEM_write_bio_PrivateKey(BIO* bp, EVP_PKEY* x, const void* /*enc*/, unsigned char* /*kstr*/,
+                             int /*klen*/, void* /*cb*/, void* /*u*/) {
+  if (!bp || !x || bp->kind != BioKind::Memory || !x->has_key) return 0;
+  if (!x->pem.empty()) {
+    bp->data.insert(bp->data.end(), x->pem.begin(), x->pem.end());
+    if (!x->pem.empty() && x->pem.back() != '\n') bp->data.push_back('\n');
+    return 1;
+  }
+  return 0;
+}
+
+STACK_OF_X509_INFO* PEM_X509_INFO_read_bio(BIO* bp, STACK_OF_X509_INFO* sk,
+                                           void* /*cb*/, void* /*u*/) {
+  if (!bp) return nullptr;
+  if (!sk) sk = new STACK_OF_X509_INFO();
+
+  while (true) {
+    auto* cert = PEM_read_bio_X509(bp, nullptr, nullptr, nullptr);
+    if (!cert) break;
+    auto* info = new X509_INFO();
+    info->x509 = cert;
+    info->crl = nullptr;
+    sk->items.push_back(info);
+  }
+  return sk;
+}
+
+/* ===== SSL methods/context ===== */
+const SSL_METHOD* TLS_client_method(void) { return &g_client_method; }
+const SSL_METHOD* TLS_server_method(void) { return &g_server_method; }
+const SSL_METHOD* SSLv23_client_method(void) { return &g_client_method; }
+const SSL_METHOD* SSLv23_server_method(void) { return &g_server_method; }
+
+SSL_CTX* SSL_CTX_new(const SSL_METHOD* method) {
+  auto* ctx = new SSL_CTX();
+  ctx->is_client = !(method && method->endpoint == 1);
+  ctx->verify_mode = SSL_VERIFY_NONE;
+  ctx->cert_store = X509_STORE_new();
+  return ctx;
+}
+
+void SSL_CTX_free(SSL_CTX* ctx) { delete ctx; }
+
+void SSL_CTX_set_verify(SSL_CTX* ctx, int mode,
+                        int (*verify_callback)(int, X509_STORE_CTX*)) {
+  if (!ctx) return;
+  ctx->verify_mode = mode;
+  ctx->verify_callback = verify_callback;
+}
+
+void SSL_CTX_set_verify_depth(SSL_CTX* ctx, int depth) {
+  if (ctx) ctx->verify_depth = depth;
+}
+
+long SSL_CTX_set_mode(SSL_CTX* ctx, long mode) {
+  if (!ctx) return 0;
+  ctx->mode |= mode;
+  return ctx->mode;
+}
+
+long SSL_CTX_clear_mode(SSL_CTX* ctx, long mode) {
+  if (!ctx) return 0;
+  ctx->mode &= ~mode;
+  return ctx->mode;
+}
+
+long SSL_CTX_set_options(SSL_CTX* ctx, long options) {
+  if (!ctx) return 0;
+  ctx->options |= options;
+  return ctx->options;
+}
+
+int SSL_CTX_set_session_cache_mode(SSL_CTX* ctx, int mode) {
+  if (!ctx) return 0;
+  ctx->session_cache_mode = mode;
+  return mode;
+}
+
+int SSL_CTX_set_cipher_list(SSL_CTX* /*ctx*/, const char* /*str*/) { return 1; }
+
+int SSL_CTX_set_ciphersuites(SSL_CTX* /*ctx*/, const char* /*str*/) { return 1; }
+
+int SSL_CTX_load_verify_locations(SSL_CTX* ctx, const char* ca_file, const char* ca_path) {
+  if (!ctx || !ctx->cert_store) return 0;
+  bool loaded = false;
+
+  if (ca_file && *ca_file) {
+    loaded = load_ca_file_into_store(ctx->cert_store, ca_file) || loaded;
+  }
+
+  if (ca_path && *ca_path) {
+    loaded = load_ca_path_into_store(ctx->cert_store, ca_path) || loaded;
+  }
+
+  return loaded ? 1 : 0;
+}
+
+int SSL_CTX_set_default_verify_paths(SSL_CTX* ctx) {
+  if (!ctx) return 0;
+  ctx->use_system_roots = true;
+  return 1;
+}
+
+int SSL_CTX_default_verify_paths(SSL_CTX* ctx) {
+  return SSL_CTX_set_default_verify_paths(ctx);
+}
+
+int SSL_CTX_use_certificate_file(SSL_CTX* ctx, const char* file, int /*type*/) {
+  if (!ctx || !file) return 0;
+  auto pem = read_file_text(file);
+  if (pem.empty()) return 0;
+  auto* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+  if (!bio) return 0;
+  auto* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+  BIO_free(bio);
+  if (!cert) return 0;
+  if (ctx->own_cert) X509_free(ctx->own_cert);
+  ctx->own_cert = cert;
+  for (auto* c : ctx->own_chain) {
+    if (c) CFRelease(c);
+  }
+  ctx->own_chain.clear();
+  if (ctx->identity) {
+    CFRelease(ctx->identity);
+    ctx->identity = nullptr;
+  }
+  return 1;
+}
+
+int SSL_CTX_use_certificate_chain_file(SSL_CTX* ctx, const char* file) {
+  if (!ctx || !file) return 0;
+  auto pem = read_file_text(file);
+  if (pem.empty()) return 0;
+
+  auto* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+  if (!bio) return 0;
+
+  std::vector<X509*> certs;
+  while (true) {
+    auto* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    if (!cert) break;
+    certs.push_back(cert);
+  }
+  BIO_free(bio);
+
+  if (certs.empty()) return 0;
+
+  if (ctx->own_cert) X509_free(ctx->own_cert);
+  ctx->own_cert = certs.front();
+
+  for (auto* c : ctx->own_chain) {
+    if (c) CFRelease(c);
+  }
+  ctx->own_chain.clear();
+  for (size_t i = 1; i < certs.size(); ++i) {
+    if (certs[i] && certs[i]->cert) {
+      CFRetain(certs[i]->cert);
+      ctx->own_chain.push_back(certs[i]->cert);
+    }
+    X509_free(certs[i]);
+  }
+
+  if (ctx->identity) {
+    CFRelease(ctx->identity);
+    ctx->identity = nullptr;
+  }
+  return 1;
+}
+
+int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const char* file, int /*type*/) {
+  if (!ctx || !file) return 0;
+  auto pem = read_file_text(file);
+  if (pem.empty()) return 0;
+  auto* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+  if (!bio) return 0;
+  auto* pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, ctx->passwd_userdata);
+  BIO_free(bio);
+  if (!pkey) return 0;
+  if (ctx->own_key) EVP_PKEY_free(ctx->own_key);
+  ctx->own_key = pkey;
+  if (ctx->identity) {
+    CFRelease(ctx->identity);
+    ctx->identity = nullptr;
+  }
+  return 1;
+}
+
+int SSL_CTX_use_certificate(SSL_CTX* ctx, X509* x) {
+  if (!ctx || !x) return 0;
+  if (ctx->own_cert) X509_free(ctx->own_cert);
+  X509_up_ref(x);
+  ctx->own_cert = x;
+  for (auto* c : ctx->own_chain) {
+    if (c) CFRelease(c);
+  }
+  ctx->own_chain.clear();
+  if (ctx->identity) {
+    CFRelease(ctx->identity);
+    ctx->identity = nullptr;
+  }
+  return 1;
+}
+
+int SSL_CTX_use_PrivateKey(SSL_CTX* ctx, EVP_PKEY* pkey) {
+  if (!ctx || !pkey || !pkey->has_key) return 0;
+  if (ctx->own_key) EVP_PKEY_free(ctx->own_key);
+  pkey->refs++;
+  ctx->own_key = pkey;
+  if (ctx->identity) {
+    CFRelease(ctx->identity);
+    ctx->identity = nullptr;
+  }
+  return 1;
+}
+
+int SSL_CTX_check_private_key(const SSL_CTX* ctx) {
+  if (!ctx || !ctx->own_cert || !ctx->own_key || !ctx->own_key->key) return 0;
+  return 1;
+}
+
+void SSL_CTX_set_default_passwd_cb_userdata(SSL_CTX* ctx, void* u) {
+  if (ctx) ctx->passwd_userdata = u;
+}
+
+X509_STORE* SSL_CTX_get_cert_store(const SSL_CTX* ctx) {
+  return ctx ? ctx->cert_store : nullptr;
+}
+
+void SSL_CTX_set_cert_store(SSL_CTX* ctx, X509_STORE* store) {
+  if (!ctx || !store) return;
+  if (ctx->cert_store == store) return;
+  if (ctx->cert_store) X509_STORE_free(ctx->cert_store);
+  ctx->cert_store = store;
+}
+
+void SSL_CTX_set_client_CA_list(SSL_CTX* ctx, STACK_OF_X509_NAME* list) {
+  if (!ctx) return;
+  if (ctx->client_ca_list) sk_X509_NAME_pop_free(ctx->client_ca_list, X509_NAME_free);
+  ctx->client_ca_list = list;
+}
+
+int SSL_CTX_set_min_proto_version(SSL_CTX* ctx, int version) {
+  if (!ctx) return 0;
+  ctx->min_proto_version = version;
+  return 1;
+}
+
+int SSL_CTX_set_alpn_protos(SSL_CTX* ctx, const unsigned char* protos, unsigned int len) {
+  if (!ctx || !protos || len == 0) return 1;
+
+  ctx->alpn_protocols.clear();
+  size_t i = 0;
+  while (i < len) {
+    unsigned int l = protos[i++];
+    if (l == 0 || i + l > len) break;
+    ctx->alpn_protocols.emplace_back(reinterpret_cast<const char*>(protos + i), l);
+    i += l;
+  }
+
+  return 0;
+}
+
+/* ===== SSL object ===== */
+SSL* SSL_new(SSL_CTX* ctx) {
+  if (!ctx) return nullptr;
+  auto* ssl = new SSL();
+  ssl->ctx = ctx;
+  ssl->verify_mode = ctx->verify_mode;
+  ssl->verify_callback = ctx->verify_callback;
+  if (!configure_ssl_instance(ssl)) {
+    delete ssl;
+    return nullptr;
+  }
+  return ssl;
+}
+
+void SSL_free(SSL* ssl) { delete ssl; }
+
+int SSL_set_fd(SSL* ssl, int fd) {
+  if (!ssl) return 0;
+  ssl->fd = fd;
+  return 1;
+}
+
+void SSL_set_bio(SSL* ssl, BIO* rbio, BIO* wbio) {
+  if (!ssl) return;
+  if (ssl->rbio) {
+    if (ssl->wbio == ssl->rbio) BIO_free(ssl->rbio);
+    else {
+      BIO_free(ssl->rbio);
+      if (ssl->wbio) BIO_free(ssl->wbio);
+    }
+  }
+  ssl->rbio = rbio;
+  ssl->wbio = wbio;
+
+  if (rbio && rbio->kind == BioKind::Socket) {
+    ssl->fd = rbio->fd;
+  }
+}
+
+BIO* SSL_get_rbio(const SSL* ssl) { return ssl ? ssl->rbio : nullptr; }
+
+int SSL_set_tlsext_host_name(SSL* ssl, const char* name) {
+  if (!ssl || !name) return 0;
+  ssl->hostname = name;
+  if (ssl->ssl && ssl->ctx && ssl->ctx->is_client) {
+    OSStatus st = SSLSetPeerDomainName(ssl->ssl, ssl->hostname.c_str(), ssl->hostname.size());
+    if (st != noErr) {
+      set_error_message("SSLSetPeerDomainName failed (" + std::to_string(st) + "): " +
+                       cferror_to_string(st));
+      return 0;
+    }
+  }
+  return 1;
+}
+
+long SSL_ctrl(SSL* ssl, int cmd, long larg, void* parg) {
+  if (!ssl) return 0;
+  if (cmd == SSL_CTRL_SET_TLSEXT_HOSTNAME && larg == TLSEXT_NAMETYPE_host_name) {
+    return SSL_set_tlsext_host_name(ssl, static_cast<const char*>(parg));
+  }
+  return 0;
+}
+
+void SSL_set_verify(SSL* ssl, int mode,
+                    int (*verify_callback)(int, X509_STORE_CTX*)) {
+  if (!ssl) return;
+  ssl->verify_mode = mode;
+  ssl->verify_callback = verify_callback;
+
+  if (!ssl->ssl || !ssl->ctx) return;
+
+  bool verify_peer = (mode & SSL_VERIFY_PEER) != 0;
+  bool has_custom_anchors = ssl->ctx->cert_store && !ssl->ctx->cert_store->certs.empty();
+  bool need_manual_verify = !verify_peer || has_custom_anchors || !ssl->ctx->use_system_roots;
+
+  if (ssl->ctx->is_client) {
+    if (need_manual_verify) {
+      SSLSetSessionOption(ssl->ssl, kSSLSessionOptionBreakOnServerAuth, true);
+    }
+  } else if (verify_peer && need_manual_verify) {
+    SSLSetSessionOption(ssl->ssl, kSSLSessionOptionBreakOnClientAuth, true);
+    SSLAuthenticate auth = (mode & SSL_VERIFY_FAIL_IF_NO_PEER_CERT)
+                               ? kAlwaysAuthenticate
+                               : kTryAuthenticate;
+    SSLSetClientSideAuthenticate(ssl->ssl, auth);
+  } else {
+    SSLSetClientSideAuthenticate(ssl->ssl, kNeverAuthenticate);
+  }
+}
+
+int SSL_set_ecdh_auto(SSL* /*ssl*/, int /*onoff*/) { return 1; }
+
+static int ssl_do_handshake(SSL* ssl) {
+  if (!ssl || !ssl->ssl_setup) return -1;
+
+  int fd = ssl->fd;
+  int old_flags = -1;
+  bool restore_nonblock = false;
+  if (fd >= 0) {
+    old_flags = fcntl(fd, F_GETFL);
+    if (old_flags != -1 && (old_flags & O_NONBLOCK)) {
+      restore_nonblock = true;
+      fcntl(fd, F_SETFL, old_flags & ~O_NONBLOCK);
+    }
+  }
+  auto restore_flags = [&]() {
+    if (restore_nonblock && old_flags != -1) {
+      fcntl(fd, F_SETFL, old_flags);
+    }
+  };
+
+  auto effective_verify_mode = ssl->verify_mode ? ssl->verify_mode : ssl->ctx->verify_mode;
+  bool require_cert = !ssl->ctx->is_client && (effective_verify_mode & SSL_VERIFY_FAIL_IF_NO_PEER_CERT);
+
+  for (;;) {
+    ssl->io_want = SSL_ERROR_NONE;
+    OSStatus st = SSLHandshake(ssl->ssl);
+
+    if (st == noErr) {
+      if (!post_handshake_verify(ssl, require_cert)) {
+        restore_flags();
+        return -1;
+      }
+      query_selected_alpn(ssl);
+      ssl->handshake_done = true;
+      ssl->last_error = SSL_ERROR_NONE;
+      ssl->last_ret = 1;
+      restore_flags();
+      return 1;
+    }
+
+    if (st == errSSLWouldBlock) {
+      ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
+      ssl->last_ret = -1;
+      restore_flags();
+      return -1;
+    }
+
+    if (st == errSSLServerAuthCompleted || st == errSSLClientAuthCompleted) {
+      if (!post_handshake_verify(ssl, require_cert)) {
+        restore_flags();
+        return -1;
+      }
+      continue;
+    }
+
+    if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+      ssl->last_error = SSL_ERROR_ZERO_RETURN;
+      ssl->last_ret = 0;
+      restore_flags();
+      return 0;
+    }
+
+    ssl->last_error = SSL_ERROR_SSL;
+    ssl->last_ret = -1;
+    set_error_message("SSLHandshake failed (" + std::to_string(st) + "): " +
+                     cferror_to_string(st));
+    restore_flags();
+    return -1;
+  }
+}
+
+int SSL_connect(SSL* ssl) { return ssl_do_handshake(ssl); }
+
+int SSL_accept(SSL* ssl) { return ssl_do_handshake(ssl); }
+
+int SSL_read(SSL* ssl, void* buf, int num) {
+  if (!ssl || !buf || num <= 0) return -1;
+
+  if (!ssl->peeked_plaintext.empty()) {
+    int n = std::min<int>(num, static_cast<int>(ssl->peeked_plaintext.size()));
+    std::memcpy(buf, ssl->peeked_plaintext.data(), static_cast<size_t>(n));
+    ssl->peeked_plaintext.erase(ssl->peeked_plaintext.begin(), ssl->peeked_plaintext.begin() + n);
+    ssl->last_ret = n;
+    ssl->last_error = SSL_ERROR_NONE;
+    return n;
+  }
+
+  ssl->io_want = SSL_ERROR_NONE;
+  size_t processed = 0;
+  OSStatus st = SSLRead(ssl->ssl, buf, static_cast<size_t>(num), &processed);
+  if (st == noErr || (st == errSSLWouldBlock && processed > 0)) {
+    ssl->last_ret = static_cast<int>(processed);
+    ssl->last_error = SSL_ERROR_NONE;
+    return static_cast<int>(processed);
+  }
+  if (st == errSSLWouldBlock) {
+    ssl->last_ret = -1;
+    ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
+    return -1;
+  }
+  if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+    ssl->last_ret = 0;
+    ssl->last_error = SSL_ERROR_ZERO_RETURN;
+    return 0;
+  }
+
+  ssl->last_ret = -1;
+  ssl->last_error = SSL_ERROR_SSL;
+  set_error_message("SSL_read failed: " + cferror_to_string(st));
+  return -1;
+}
+
+int SSL_write(SSL* ssl, const void* buf, int num) {
+  if (!ssl || !buf || num <= 0) return -1;
+
+  ssl->io_want = SSL_ERROR_NONE;
+  size_t processed = 0;
+  OSStatus st = SSLWrite(ssl->ssl, buf, static_cast<size_t>(num), &processed);
+  if (st == noErr || (st == errSSLWouldBlock && processed > 0)) {
+    ssl->last_ret = static_cast<int>(processed);
+    ssl->last_error = SSL_ERROR_NONE;
+    return static_cast<int>(processed);
+  }
+  if (st == errSSLWouldBlock) {
+    ssl->last_ret = -1;
+    ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_WRITE;
+    return -1;
+  }
+  if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+    ssl->last_ret = 0;
+    ssl->last_error = SSL_ERROR_ZERO_RETURN;
+    return 0;
+  }
+
+  ssl->last_ret = -1;
+  ssl->last_error = SSL_ERROR_SSL;
+  set_error_message("SSL_write failed: " + cferror_to_string(st));
+  return -1;
+}
+
+int SSL_peek(SSL* ssl, void* buf, int num) {
+  if (!ssl || !buf || num <= 0) return -1;
+
+  if (ssl->peeked_plaintext.empty()) {
+    std::vector<unsigned char> tmp(static_cast<size_t>(num));
+    ssl->io_want = SSL_ERROR_NONE;
+    size_t processed = 0;
+    OSStatus st = SSLRead(ssl->ssl, tmp.data(), tmp.size(), &processed);
+    if (st == noErr || (st == errSSLWouldBlock && processed > 0)) {
+      ssl->peeked_plaintext.assign(tmp.begin(), tmp.begin() + static_cast<long>(processed));
+    } else if (st == errSSLWouldBlock) {
+      ssl->last_ret = -1;
+      ssl->last_error = ssl->io_want ? ssl->io_want : SSL_ERROR_WANT_READ;
+      return -1;
+    } else if (st == errSSLClosedGraceful || st == errSSLClosedAbort || st == errSSLClosedNoNotify) {
+      ssl->last_ret = 0;
+      ssl->last_error = SSL_ERROR_ZERO_RETURN;
+      return 0;
+    } else {
+      ssl->last_ret = -1;
+      ssl->last_error = SSL_ERROR_SSL;
+      set_error_message("SSL_peek failed: " + cferror_to_string(st));
+      return -1;
+    }
+  }
+
+  int n = std::min<int>(num, static_cast<int>(ssl->peeked_plaintext.size()));
+  std::memcpy(buf, ssl->peeked_plaintext.data(), static_cast<size_t>(n));
+  ssl->last_ret = n;
+  ssl->last_error = SSL_ERROR_NONE;
+  return n;
+}
+
+int SSL_pending(const SSL* ssl) {
+  if (!ssl || !ssl->ssl) return 0;
+  size_t pending = 0;
+  SSLGetBufferedReadSize(ssl->ssl, &pending);
+  return static_cast<int>(pending + ssl->peeked_plaintext.size());
+}
+
+int SSL_shutdown(SSL* ssl) {
+  if (!ssl || !ssl->ssl) return 0;
+  OSStatus st = SSLClose(ssl->ssl);
+  ssl->last_ret = (st == noErr) ? 1 : -1;
+  ssl->last_error = (st == noErr) ? SSL_ERROR_NONE : SSL_ERROR_SSL;
+  if (st != noErr) set_error_message("SSLClose failed: " + cferror_to_string(st));
+  return st == noErr ? 1 : 0;
+}
+
+int SSL_get_error(const SSL* ssl, int /*ret*/) {
+  if (!ssl) return SSL_ERROR_SSL;
+  return ssl->last_error;
+}
+
+X509* SSL_get_peer_certificate(const SSL* ssl) {
+  if (!ssl || !ssl->peer_cert) return nullptr;
+  if (ssl->peer_cert->der.empty()) return nullptr;
+  return x509_from_der(ssl->peer_cert->der.data(), ssl->peer_cert->der.size());
+}
+
+X509* SSL_get1_peer_certificate(const SSL* ssl) { return SSL_get_peer_certificate(ssl); }
+
+long SSL_get_verify_result(const SSL* ssl) {
+  if (!ssl) return X509_V_ERR_UNSPECIFIED;
+  return ssl->verify_result;
+}
+
+X509_VERIFY_PARAM* SSL_get0_param(SSL* ssl) {
+  if (!ssl) return nullptr;
+  return &ssl->param;
+}
+
+int SSL_get_ex_data_X509_STORE_CTX_idx(void) { return 0; }
+
+const char* SSL_get_servername(const SSL* ssl, const int type) {
+  if (!ssl || type != TLSEXT_NAMETYPE_host_name) return nullptr;
+  if (!ssl->hostname.empty()) return ssl->hostname.c_str();
+  if (ssl->ssl) {
+    char buf[256] = {0};
+    size_t len = sizeof(buf);
+    if (SSLGetPeerDomainName(ssl->ssl, buf, &len) == noErr && len > 0) {
+      auto* self = const_cast<SSL*>(ssl);
+      self->hostname.assign(buf, buf + len);
+      return self->hostname.c_str();
+    }
+  }
+  return nullptr;
+}
+
+void SSL_get0_alpn_selected(const SSL* ssl, const unsigned char** data, unsigned int* len) {
+  if (data) *data = nullptr;
+  if (len) *len = 0;
+  if (!ssl || ssl->selected_alpn.empty()) return;
+  if (data) *data = reinterpret_cast<const unsigned char*>(ssl->selected_alpn.data());
+  if (len) *len = static_cast<unsigned int>(ssl->selected_alpn.size());
+}
+
+void SSL_clear_mode(SSL* ssl, long mode) {
+  if (!ssl || !ssl->ctx) return;
+  ssl->ctx->mode &= ~mode;
+}
+
+STACK_OF_X509_NAME* SSL_load_client_CA_file(const char* file) {
+  if (!file) return nullptr;
+  auto pem = read_file_text(file);
+  if (pem.empty()) return nullptr;
+
+  auto* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+  if (!bio) return nullptr;
+
+  auto* list = sk_X509_NAME_new_null();
+  if (!list) {
+    BIO_free(bio);
+    return nullptr;
+  }
+
+  while (true) {
+    auto* cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    if (!cert) break;
+    auto* name = X509_get_subject_name(cert);
+    if (name) {
+      auto* dup = X509_NAME_dup(name);
+      if (dup) sk_X509_NAME_push(list, dup);
+    }
+    X509_free(cert);
+  }
+
+  BIO_free(bio);
+  if (sk_X509_NAME_num(list) == 0) {
+    sk_X509_NAME_free(list);
+    return nullptr;
+  }
+  return list;
+}
+
+} // extern "C"

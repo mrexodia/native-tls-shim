@@ -1,5 +1,4 @@
 #include "tls_internal.hpp"
-#include "tls_schannel.h"
 
 #include "openssl/bio.h"
 #include "openssl/crypto.h"
