@@ -7,9 +7,14 @@ OpenSSL header shim for projects that expect `openssl/*` APIs (notably `cpp-http
 - ✅ OpenSSL-compatible header surface (`openssl/`)
 - ✅ mbedTLS-backed implementation
 - ✅ Schannel backend implementation on Windows (`src/tls_schannel.*`) with no mbedTLS dependency
-- 🚧 Apple Security backend placeholders (`src/tls_apple.*`)
+- ✅ Apple Security (SecureTransport) backend on macOS (`src/tls_apple.*`)
 
 ## Build
+
+`NATIVE_TLS_SHIM_BACKEND` supports `AUTO`, `MBEDTLS`, `SCHANNEL`, and `APPLE`.
+`AUTO` selects SCHANNEL on Windows, APPLE on macOS, and MBEDTLS elsewhere.
+
+Example mbedTLS build:
 
 ```bash
 cmake -S . -B build -DNATIVE_TLS_SHIM_BACKEND=MBEDTLS
@@ -21,6 +26,13 @@ For Schannel backend build (no mbedTLS dependency):
 ```bash
 cmake -S . -B build-schannel -DNATIVE_TLS_SHIM_BACKEND=SCHANNEL -DNATIVE_TLS_SHIM_FETCH_MBEDTLS=OFF
 cmake --build build-schannel
+```
+
+For Apple backend build (no mbedTLS dependency):
+
+```bash
+cmake -S . -B build-apple -DNATIVE_TLS_SHIM_BACKEND=APPLE -DNATIVE_TLS_SHIM_FETCH_MBEDTLS=OFF
+cmake --build build-apple
 ```
 
 When this project is the **top-level** CMake project, tests/examples are
@@ -107,6 +119,13 @@ Current test set covers:
 - IXWebSocket peer verification disabled
 - IX Http TLS matrix (trusted/untrusted/hostname/in-memory-CA)
 - IXWebSocket mTLS (client cert required)
+
+## Cipher suites
+
+The Apple SecureTransport backend defaults to AEAD-only cipher suites
+(AES-GCM and ChaCha20-Poly1305). `SSL_CTX_set_cipher_list` and
+`SSL_CTX_set_ciphersuites` accept OpenSSL-style tokens, but are filtered
+to AEAD suites; empty/unsupported lists are rejected.
 
 ## Current mbedTLS backend note
 
