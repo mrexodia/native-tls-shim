@@ -582,7 +582,7 @@ bool setup_ssl_context(SSL_CTX* ctx) {
   }
 
   mbedtls_ssl_conf_rng(&ctx->conf, mbedtls_ctr_drbg_random, &ctx->ctr_drbg);
-#ifdef MBEDTLS_SSL_VERSION_TLS1_3
+#if defined(MBEDTLS_SSL_PROTO_TLS1_3)
   mbedtls_ssl_conf_max_tls_version(&ctx->conf, MBEDTLS_SSL_VERSION_TLS1_3);
 #else
   mbedtls_ssl_conf_max_tls_version(&ctx->conf, MBEDTLS_SSL_VERSION_TLS1_2);
@@ -595,6 +595,7 @@ bool setup_ssl_context(SSL_CTX* ctx) {
 
 bool setup_ssl_instance(SSL* ssl) {
   if (!ssl || !ssl->ctx) return false;
+  apply_ctx_ca_store(ssl->ctx);
   int rc = mbedtls_ssl_setup(&ssl->ssl, &ssl->ctx->conf);
   if (rc != 0) {
     char err[256] = {0};
