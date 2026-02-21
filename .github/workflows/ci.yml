@@ -28,14 +28,13 @@ jobs:
             build_tests: "ON"
             run_tests: "true"
 
-          # macOS: native (AUTO -> APPLE, currently placeholder) + forced mbedTLS
-          # Native Apple backend is build-only for now.
-          - name: macos-native-apple-build-only
+          # macOS: native (AUTO -> APPLE) + forced mbedTLS
+          - name: macos-native-apple
             os: macos-latest
             backend: AUTO
             fetch_mbedtls: "OFF"
-            build_tests: "OFF"
-            run_tests: "false"
+            build_tests: "ON"
+            run_tests: "true"
 
           - name: macos-forced-mbedtls
             os: macos-latest
@@ -82,4 +81,3 @@ jobs:
         if: matrix.run_tests == 'true'
         run: >-
           ctest --test-dir build -C Debug --output-on-failure
-          --exclude-regex test_ixwebsocket_client
