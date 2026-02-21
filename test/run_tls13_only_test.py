@@ -60,6 +60,8 @@ def run():
     venv_dir = server_build / ".venv"
 
     config = os.environ.get("CTEST_CONFIGURATION_TYPE")
+    if sys.platform.startswith("win") and not config:
+        config = "Debug"
     build_config = config or "Debug"
 
     python_exe = ensure_venv(venv_dir)
