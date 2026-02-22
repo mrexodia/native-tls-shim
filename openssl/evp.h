@@ -28,7 +28,6 @@ const EVP_MD* EVP_sha512(void);
 EVP_PKEY* d2i_PrivateKey_bio(BIO* bp, EVP_PKEY** a);
 int       EVP_PKEY_is_a(const EVP_PKEY* pkey, const char* name);
 void      EVP_PKEY_free(EVP_PKEY* pkey);
-void      EVP_cleanup(void);
 
 #ifdef __cplusplus
 }

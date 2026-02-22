@@ -18,8 +18,6 @@ typedef struct ssl_st SSL;
 typedef struct ssl_method_st SSL_METHOD;
 typedef struct ssl_session_st SSL_SESSION;
 typedef struct evp_pkey_st EVP_PKEY;
-typedef struct rsa_st RSA;
-typedef struct dh_st DH;
 
 typedef int pem_password_cb(char* buf, int size, int rwflag, void* userdata);
 
@@ -99,8 +97,6 @@ const SSL_METHOD* SSLv23_server_method(void);
 /* Global init */
 int OPENSSL_init_ssl(uint64_t opts, const void* settings);
 int OpenSSL_add_ssl_algorithms(void);
-int OpenSSL_add_all_algorithms(void);
-int SSL_library_init(void);
 int SSL_load_error_strings(void);
 void OPENSSL_thread_stop(void);
 
@@ -131,9 +127,6 @@ int  SSL_CTX_use_certificate(SSL_CTX* ctx, X509* x);
 int  SSL_CTX_use_certificate_ASN1(SSL_CTX* ctx, int len, const unsigned char* d);
 int  SSL_CTX_use_PrivateKey(SSL_CTX* ctx, EVP_PKEY* pkey);
 int  SSL_CTX_use_PrivateKey_ASN1(int pk, SSL_CTX* ctx, const unsigned char* d, long len);
-int  SSL_CTX_use_RSAPrivateKey(SSL_CTX* ctx, RSA* rsa);
-int  SSL_CTX_use_RSAPrivateKey_ASN1(SSL_CTX* ctx, const unsigned char* d, long len);
-int  SSL_CTX_use_RSAPrivateKey_file(SSL_CTX* ctx, const char* file, int type);
 int  SSL_CTX_check_private_key(const SSL_CTX* ctx);
 void SSL_CTX_set_default_passwd_cb(SSL_CTX* ctx, pem_password_cb* cb);
 pem_password_cb* SSL_CTX_get_default_passwd_cb(SSL_CTX* ctx);
@@ -146,7 +139,6 @@ int  SSL_CTX_set_alpn_protos(SSL_CTX* ctx, const unsigned char* protos, unsigned
 int  SSL_CTX_add_extra_chain_cert(SSL_CTX* ctx, X509* x509);
 void SSL_CTX_clear_chain_certs(SSL_CTX* ctx);
 int  SSL_CTX_set0_tmp_dh_pkey(SSL_CTX* ctx, EVP_PKEY* pkey);
-int  SSL_CTX_set_tmp_dh(SSL_CTX* ctx, DH* dh);
 
 void  SSL_CTX_set_app_data(SSL_CTX* ctx, void* arg);
 void* SSL_CTX_get_app_data(const SSL_CTX* ctx);

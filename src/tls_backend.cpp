@@ -1,8 +1,6 @@
 #include "tls_internal.hpp"
 
-#include "openssl/conf.h"
 #include "openssl/crypto.h"
-#include "openssl/engine.h"
 #include "openssl/err.h"
 #include "openssl/evp.h"
 #include "openssl/ssl.h"
@@ -19,9 +17,6 @@ thread_local unsigned long g_last_error_code = 0;
 thread_local std::string g_last_error_message;
 thread_local unsigned long g_last_popped_error_code = 0;
 thread_local std::string g_last_popped_error_message;
-
-void (*g_locking_callback)(int, int, const char*, int) = nullptr;
-unsigned long (*g_id_callback)(void) = nullptr;
 
 std::mutex g_app_data_mutex;
 std::unordered_map<const SSL*, void*> g_ssl_app_data;
@@ -77,24 +72,6 @@ void OPENSSL_cleanse(void* ptr, size_t len) {
 
 void OPENSSL_thread_stop(void) {}
 
-int CRYPTO_num_locks(void) { return 0; }
-
-void* CRYPTO_get_locking_callback(void) {
-  return reinterpret_cast<void*>(g_locking_callback);
-}
-
-void CRYPTO_set_locking_callback(void (*func)(int, int, const char*, int)) {
-  g_locking_callback = func;
-}
-
-void* CRYPTO_get_id_callback(void) {
-  return reinterpret_cast<void*>(g_id_callback);
-}
-
-void CRYPTO_set_id_callback(unsigned long (*func)(void)) { g_id_callback = func; }
-
-void CRYPTO_cleanup_all_ex_data(void) {}
-
 unsigned long ERR_get_error(void) { return native_tls::pop_last_error_code(); }
 
 unsigned long ERR_peek_error(void) { return native_tls::peek_last_error_code(); }
@@ -138,29 +115,13 @@ const char* ERR_reason_error_string(unsigned long e) {
   return buf.data();
 }
 
-const char* ERR_func_error_string(unsigned long /*e*/) { return nullptr; }
-
 void ERR_clear_error(void) { native_tls::set_last_error(0, {}); }
-
-void ERR_free_strings(void) {}
-
-int OPENSSL_config(const char* /*config_name*/) { return 1; }
-
-void CONF_modules_unload(int /*all*/) {}
 
 int OPENSSL_init_ssl(uint64_t /*opts*/, const void* /*settings*/) { return 1; }
 
 int OpenSSL_add_ssl_algorithms(void) { return 1; }
 
-int OpenSSL_add_all_algorithms(void) { return 1; }
-
-int SSL_library_init(void) { return 1; }
-
 int SSL_load_error_strings(void) { return 1; }
-
-void EVP_cleanup(void) {}
-
-void ENGINE_cleanup(void) {}
 
 void SSL_set_app_data(SSL* ssl, void* arg) {
   if (!ssl) return;
@@ -196,14 +157,5 @@ void* SSL_CTX_get_app_data(const SSL_CTX* ctx) {
   return it == g_ssl_ctx_app_data.end() ? nullptr : it->second;
 }
 
-void RSA_free(RSA* /*rsa*/) {
-  // Legacy low-level RSA API is intentionally unsupported in this shim.
-  // We currently do not create RSA* objects anywhere, so this is a no-op.
-}
-
-void DH_free(DH* /*dh*/) {
-  // Legacy low-level DH API is intentionally unsupported in this shim.
-  // We currently do not create DH* objects anywhere, so this is a no-op.
-}
 
 } // extern "C"

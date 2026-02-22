@@ -3,9 +3,8 @@
 /*
  * Minimal RSA compatibility header.
  *
- * native-tls-shim targets TLS APIs and OpenSSL 3.x code paths first.
- * Low-level RSA primitives are not implemented yet; this header exists so
- * projects that include <openssl/rsa.h> (e.g. Asio type glue) still compile.
+ * OpenSSL 3.x code paths in our target libraries do not require low-level
+ * RSA APIs. We only expose the opaque type for compatibility with includes.
  */
 
 #ifdef __cplusplus
@@ -13,8 +12,6 @@ extern "C" {
 #endif
 
 typedef struct rsa_st RSA;
-
-void RSA_free(RSA* rsa);
 
 #ifdef __cplusplus
 }

@@ -270,9 +270,6 @@ struct evp_md_ctx_st {
   ~evp_md_ctx_st() { mbedtls_md_free(&md); }
 };
 
-struct rsa_st {};
-struct dh_st {};
-
 struct ssl_ctx_st {
   bool is_client = true;
   int verify_mode = SSL_VERIFY_NONE;
@@ -1486,28 +1483,8 @@ EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bp, EVP_PKEY** x, void* /*cb*/, void* u) 
   return pkey;
 }
 
-RSA* PEM_read_bio_RSAPrivateKey(BIO* bp, RSA** x, pem_password_cb* cb, void* u) {
-  (void)bp;
-  (void)cb;
-  (void)u;
-  if (x) *x = nullptr;
-  set_error_message("PEM_read_bio_RSAPrivateKey is not implemented by native-tls-shim",
-                    ERR_R_PEM_LIB, ERR_LIB_PEM);
-  return nullptr;
-}
-
 EVP_PKEY* PEM_read_bio_Parameters(BIO* bp, EVP_PKEY** x) {
   return PEM_read_bio_PrivateKey(bp, x, nullptr, nullptr);
-}
-
-DH* PEM_read_bio_DHparams(BIO* bp, DH** x, pem_password_cb* cb, void* u) {
-  (void)bp;
-  (void)cb;
-  (void)u;
-  if (x) *x = nullptr;
-  set_error_message("PEM_read_bio_DHparams is not implemented by native-tls-shim",
-                    ERR_R_PEM_LIB, ERR_LIB_PEM);
-  return nullptr;
 }
 
 int PEM_write_bio_X509(BIO* bp, X509* x) {
@@ -1887,23 +1864,6 @@ int SSL_CTX_use_PrivateKey_ASN1(int /*pk*/, SSL_CTX* ctx, const unsigned char* d
   return apply_ctx_own_cert(ctx) ? 1 : 0;
 }
 
-// NOTE: native-tls-shim does not implement legacy low-level RSA/DH key APIs.
-// For SSL_CTX_use_* style functions, OpenSSL uses 1=success and 0=failure,
-// so unsupported entry points below return 0 and set ERR_* details.
-int SSL_CTX_use_RSAPrivateKey(SSL_CTX* /*ctx*/, RSA* /*rsa*/) {
-  set_error_message("SSL_CTX_use_RSAPrivateKey is not implemented by native-tls-shim",
-                    1, ERR_LIB_SSL);
-  return 0;
-}
-
-int SSL_CTX_use_RSAPrivateKey_ASN1(SSL_CTX* ctx, const unsigned char* d, long len) {
-  return SSL_CTX_use_PrivateKey_ASN1(0, ctx, d, len);
-}
-
-int SSL_CTX_use_RSAPrivateKey_file(SSL_CTX* ctx, const char* file, int type) {
-  return SSL_CTX_use_PrivateKey_file(ctx, file, type);
-}
-
 int SSL_CTX_check_private_key(const SSL_CTX* ctx) {
   if (!ctx || !ctx->own_cert_loaded || !ctx->own_key_loaded) return 0;
 #if MBEDTLS_VERSION_MAJOR >= 3
@@ -1961,12 +1921,6 @@ void SSL_CTX_clear_chain_certs(SSL_CTX* /*ctx*/) {}
 int SSL_CTX_set0_tmp_dh_pkey(SSL_CTX* /*ctx*/, EVP_PKEY* pkey) {
   if (pkey) EVP_PKEY_free(pkey);
   set_error_message("SSL_CTX_set0_tmp_dh_pkey is not implemented by native-tls-shim",
-                    1, ERR_LIB_SSL);
-  return 0;
-}
-
-int SSL_CTX_set_tmp_dh(SSL_CTX* /*ctx*/, DH* /*dh*/) {
-  set_error_message("SSL_CTX_set_tmp_dh is not implemented by native-tls-shim",
                     1, ERR_LIB_SSL);
   return 0;
 }

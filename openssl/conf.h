@@ -1,12 +1,8 @@
 #pragma once
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int  OPENSSL_config(const char* config_name);
-void CONF_modules_unload(int all);
-
-#ifdef __cplusplus
-}
-#endif
+/*
+ * Minimal CONF compatibility header.
+ *
+ * native-tls-shim targets OpenSSL 3.x style code paths and does not expose
+ * legacy OPENSSL_config / CONF_modules_unload APIs.
+ */

@@ -3,8 +3,8 @@
 /*
  * Minimal DH compatibility header.
  *
- * native-tls-shim currently does not implement low-level DH primitives.
- * This header exists to satisfy includes and type references.
+ * OpenSSL 3.x code paths in our target libraries do not require low-level
+ * DH APIs. We only expose the opaque type for compatibility with includes.
  */
 
 #ifdef __cplusplus
@@ -12,8 +12,6 @@ extern "C" {
 #endif
 
 typedef struct dh_st DH;
-
-void DH_free(DH* dh);
 
 #ifdef __cplusplus
 }

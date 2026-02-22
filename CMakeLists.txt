@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 project(native_tls_shim VERSION 0.1.0 LANGUAGES C CXX)
 
+set(NATIVE_TLS_SHIM_OPENSSL_VERSION "3.0.0")
+
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 # When embedded via FetchContent/add_subdirectory, propagate the module path so
 # sibling dependencies can transparently resolve find_package(OpenSSL).
@@ -174,7 +176,7 @@ if(NATIVE_TLS_SHIM_ENABLE_INSTALL)
 
   write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/OpenSSLConfigVersion.cmake
-    VERSION ${PROJECT_VERSION}
+    VERSION ${NATIVE_TLS_SHIM_OPENSSL_VERSION}
     COMPATIBILITY AnyNewerVersion)
 
   install(FILES
