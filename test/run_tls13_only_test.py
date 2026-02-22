@@ -50,6 +50,8 @@ def run():
     parser.add_argument("--build-dir", required=True)
     parser.add_argument("--source-dir", required=True)
     parser.add_argument("--port", type=int, default=9471)
+    parser.add_argument("--client-bin", required=True)
+    parser.add_argument("--config", default="")
     args = parser.parse_args()
 
     build_dir = Path(args.build_dir)
@@ -59,10 +61,8 @@ def run():
     server_build = build_dir / "tls13_server"
     venv_dir = server_build / ".venv"
 
-    config = os.environ.get("CTEST_CONFIGURATION_TYPE")
-    if sys.platform.startswith("win") and not config:
-        config = "Debug"
-    build_config = config or "Debug"
+    config = args.config or os.environ.get("CTEST_CONFIGURATION_TYPE", "")
+    build_config = config
 
     python_exe = ensure_venv(venv_dir)
     cmake_config = [
@@ -81,12 +81,12 @@ def run():
     subprocess.check_call(cmake_config)
     subprocess.check_call(cmake_build)
 
-    if config:
+    if build_config:
         server_bin = exe_path(server_build / build_config / "tls13_only_server")
-        client_bin = exe_path(build_dir / "test" / build_config / "test_tls13_only_client")
     else:
         server_bin = exe_path(server_build / "tls13_only_server")
-        client_bin = exe_path(build_dir / "test" / "test_tls13_only_client")
+
+    client_bin = exe_path(Path(args.client_bin))
 
     if not server_bin.exists():
         raise FileNotFoundError(f"Server binary not found: {server_bin}")
@@ -113,7 +113,10 @@ def run():
             raise RuntimeError("TLS 1.3 server failed to start")
 
         client_cmd = [str(client_bin), str(args.port)]
-        result = subprocess.run(client_cmd)
+        try:
+            result = subprocess.run(client_cmd, timeout=20)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("TLS 1.3 client test timed out") from exc
         if result.returncode != 0:
             raise RuntimeError("TLS 1.3 client test failed")
     finally:

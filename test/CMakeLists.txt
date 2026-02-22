@@ -2,6 +2,7 @@ include(FetchContent)
 
 set(_cpp_httplib_dir "${CMAKE_SOURCE_DIR}/test/cpp-httplib")
 set(_ixws_dir "${CMAKE_SOURCE_DIR}/test/IXWebSocket")
+set(_asio_include_dir "${CMAKE_SOURCE_DIR}/test/asio/asio/include")
 
 # ---- cpp-httplib ----
 set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE ON CACHE BOOL "" FORCE)
@@ -117,6 +118,23 @@ add_executable(test_tls13_only_client test_tls13_only_client.cpp)
 target_compile_definitions(test_tls13_only_client PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT NTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(test_tls13_only_client PRIVATE httplib::httplib OpenSSL::SSL OpenSSL::Crypto)
 
+if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS" AND EXISTS "${_asio_include_dir}/asio.hpp")
+  add_executable(test_asio_https_server test_asio_https_server.cpp)
+  target_include_directories(test_asio_https_server PRIVATE "${_asio_include_dir}")
+  target_compile_definitions(test_asio_https_server PRIVATE ASIO_STANDALONE)
+  target_link_libraries(test_asio_https_server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
+  add_executable(test_asio_https_client test_asio_https_client.cpp)
+  target_include_directories(test_asio_https_client PRIVATE "${_asio_include_dir}")
+  target_compile_definitions(test_asio_https_client PRIVATE ASIO_STANDALONE)
+  target_link_libraries(test_asio_https_client PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
+  if(WIN32)
+    target_link_libraries(test_asio_https_server PRIVATE ws2_32)
+    target_link_libraries(test_asio_https_client PRIVATE ws2_32)
+  endif()
+endif()
+
 add_test(NAME test_httplib_client COMMAND test_httplib_client)
 add_test(NAME test_httplib_server COMMAND test_httplib_server)
 add_test(NAME test_httplib_verify_disabled COMMAND test_httplib_verify_disabled)
@@ -134,8 +152,22 @@ add_test(NAME test_ixwebsocket_server COMMAND test_ixwebsocket_server)
 add_test(NAME test_ixwebsocket_verify_disabled COMMAND test_ixwebsocket_verify_disabled)
 add_test(NAME test_ixhttp_tls_matrix COMMAND test_ixhttp_tls_matrix)
 add_test(NAME test_ixwebsocket_mtls COMMAND test_ixwebsocket_mtls)
+if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS" AND EXISTS "${_asio_include_dir}/asio.hpp")
+  add_test(NAME test_asio_https_roundtrip
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_asio_https_roundtrip.py
+      --source-dir ${CMAKE_SOURCE_DIR}
+      --server-bin $<TARGET_FILE:test_asio_https_server>
+      --client-bin $<TARGET_FILE:test_asio_https_client>)
+  set_tests_properties(test_asio_https_roundtrip PROPERTIES TIMEOUT 60)
+endif()
 if(NOT NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
-  add_test(NAME test_tls13_only COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tls13_only_test.py --build-dir ${CMAKE_BINARY_DIR} --source-dir ${CMAKE_SOURCE_DIR})
+  add_test(NAME test_tls13_only
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tls13_only_test.py
+      --build-dir ${CMAKE_BINARY_DIR}
+      --source-dir ${CMAKE_SOURCE_DIR}
+      --client-bin $<TARGET_FILE:test_tls13_only_client>
+      --config $<CONFIG>)
+  set_tests_properties(test_tls13_only PROPERTIES TIMEOUT 120)
 endif()
 
 add_executable(debug_schannel_init debug_schannel_init.cpp)

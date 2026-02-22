@@ -4,8 +4,9 @@
 extern "C" {
 #endif
 
-int  OPENSSL_config(const char* config_name);
-void CONF_modules_unload(int all);
+typedef struct engine_st ENGINE;
+
+void ENGINE_cleanup(void);
 
 #ifdef __cplusplus
 }

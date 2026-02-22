@@ -4,3 +4,6 @@
 [submodule "test/IXWebSocket"]
 	path = test/IXWebSocket
 	url = https://github.com/mrexodia/IXWebSocket
+[submodule "test/asio"]
+	path = test/asio
+	url = https://github.com/chriskohlhoff/asio.git

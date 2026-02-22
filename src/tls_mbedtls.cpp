@@ -28,10 +28,13 @@
 #include <array>
 #include <cassert>
 #include <cctype>
+#include <cstddef>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <regex>
@@ -234,7 +237,7 @@ struct bio_method_st {
   int kind;
 };
 
-enum class BioKind { Socket, Memory };
+enum class BioKind { Socket, Memory, Pair };
 
 struct bio_st {
   BioKind kind = BioKind::Memory;
@@ -242,6 +245,7 @@ struct bio_st {
   bool close_on_free = false;
   std::vector<unsigned char> data;
   size_t offset = 0;
+  BIO* pair = nullptr;
 };
 
 struct evp_pkey_st {
@@ -266,6 +270,9 @@ struct evp_md_ctx_st {
   ~evp_md_ctx_st() { mbedtls_md_free(&md); }
 };
 
+struct rsa_st {};
+struct dh_st {};
+
 struct ssl_ctx_st {
   bool is_client = true;
   int verify_mode = SSL_VERIFY_NONE;
@@ -276,7 +283,9 @@ struct ssl_ctx_st {
   long options = 0;
   int session_cache_mode = SSL_SESS_CACHE_OFF;
   int min_proto_version = TLS1_2_VERSION;
+  int max_proto_version = TLS1_3_VERSION;
 
+  pem_password_cb* passwd_cb = nullptr;
   void* passwd_userdata = nullptr;
 
   X509_STORE* cert_store = nullptr;
@@ -326,7 +335,11 @@ struct ssl_st {
   BIO* wbio = nullptr;
 
   int verify_mode = SSL_VERIFY_NONE;
+  int verify_depth = 0;
   int (*verify_callback)(int, X509_STORE_CTX*) = nullptr;
+
+  long mode = 0;
+  int shutdown_state = 0;
 
   int last_error = SSL_ERROR_NONE;
   int last_ret = 1;
@@ -354,6 +367,7 @@ struct ssl_st {
   }
 };
 
+const ssl_method_st g_any_method{0};
 const ssl_method_st g_client_method{MBEDTLS_SSL_IS_CLIENT};
 const ssl_method_st g_server_method{MBEDTLS_SSL_IS_SERVER};
 const bio_method_st g_mem_method{1};
@@ -409,6 +423,9 @@ int ssl_recv_cb(void* ctx, unsigned char* buf, size_t len) {
   }
   return rc;
 }
+
+int ssl_send_bio_cb(void* ctx, const unsigned char* buf, size_t len);
+int ssl_recv_bio_cb(void* ctx, unsigned char* buf, size_t len);
 
 void refresh_x509_fields(X509* x) {
   if (!x) return;
@@ -618,6 +635,8 @@ bool setup_ssl_instance(SSL* ssl) {
 
   if (ssl->fd >= 0) {
     mbedtls_ssl_set_bio(&ssl->ssl, &ssl->fd, ssl_send_cb, ssl_recv_cb, nullptr);
+  } else if (ssl->rbio || ssl->wbio) {
+    mbedtls_ssl_set_bio(&ssl->ssl, ssl, ssl_send_bio_cb, ssl_recv_bio_cb, nullptr);
   }
   return true;
 }
@@ -771,6 +790,40 @@ bool next_pem_block(BIO* bio, const char* begin_tag, const char* end_tag,
   return true;
 }
 
+size_t bio_pending_bytes(const BIO* bio) {
+  if (!bio || bio->offset >= bio->data.size()) return 0;
+  return bio->data.size() - bio->offset;
+}
+
+void bio_compact(BIO* bio) {
+  if (!bio || bio->offset == 0) return;
+  if (bio->offset >= bio->data.size()) {
+    bio->data.clear();
+    bio->offset = 0;
+    return;
+  }
+
+  if (bio->offset > 4096) {
+    bio->data.erase(bio->data.begin(), bio->data.begin() + static_cast<std::ptrdiff_t>(bio->offset));
+    bio->offset = 0;
+  }
+}
+
+int ssl_send_bio_cb(void* ctx, const unsigned char* buf, size_t len) {
+  auto* ssl = static_cast<SSL*>(ctx);
+  if (!ssl || !ssl->wbio) return MBEDTLS_ERR_NET_SEND_FAILED;
+  int rc = BIO_write(ssl->wbio, buf, static_cast<int>(len));
+  if (rc <= 0) return MBEDTLS_ERR_SSL_WANT_WRITE;
+  return rc;
+}
+
+int ssl_recv_bio_cb(void* ctx, unsigned char* buf, size_t len) {
+  auto* ssl = static_cast<SSL*>(ctx);
+  if (!ssl || !ssl->rbio) return MBEDTLS_ERR_NET_RECV_FAILED;
+  int rc = BIO_read(ssl->rbio, buf, static_cast<int>(len));
+  if (rc <= 0) return MBEDTLS_ERR_SSL_WANT_READ;
+  return rc;
+}
 
 extern "C" {
 
@@ -807,7 +860,84 @@ BIO* BIO_new(const BIO_METHOD* method) {
   return BIO_new_mem_buf(nullptr, 0);
 }
 
+BIO* BIO_new_file(const char* filename, const char* mode) {
+  if (!filename || !mode || std::strchr(mode, 'r') == nullptr) return nullptr;
+  std::ifstream ifs(filename, std::ios::binary);
+  if (!ifs) return nullptr;
+
+  std::string bytes((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+  return BIO_new_mem_buf(bytes.data(), static_cast<int>(bytes.size()));
+}
+
+int BIO_new_bio_pair(BIO** bio1, size_t /*writebuf1*/, BIO** bio2, size_t /*writebuf2*/) {
+  if (!bio1 || !bio2) return 0;
+  auto* a = new BIO();
+  auto* b = new BIO();
+  a->kind = BioKind::Pair;
+  b->kind = BioKind::Pair;
+  a->pair = b;
+  b->pair = a;
+  *bio1 = a;
+  *bio2 = b;
+  return 1;
+}
+
 const BIO_METHOD* BIO_s_mem(void) { return &g_mem_method; }
+
+int BIO_read(BIO* bio, void* data, int len) {
+  if (!bio || !data || len <= 0) return -1;
+
+  if ((bio->kind == BioKind::Memory || bio->kind == BioKind::Pair) && bio_pending_bytes(bio) > 0) {
+    int n = static_cast<int>(std::min<size_t>(static_cast<size_t>(len), bio_pending_bytes(bio)));
+    std::memcpy(data, bio->data.data() + bio->offset, static_cast<size_t>(n));
+    bio->offset += static_cast<size_t>(n);
+    bio_compact(bio);
+    return n;
+  }
+
+  if (bio->kind == BioKind::Socket && bio->fd >= 0) {
+#ifdef _WIN32
+    int rc = recv(bio->fd, static_cast<char*>(data), len, 0);
+#else
+    int rc = static_cast<int>(recv(bio->fd, data, static_cast<size_t>(len), 0));
+#endif
+    return rc;
+  }
+
+  return -1;
+}
+
+int BIO_write(BIO* bio, const void* data, int len) {
+  if (!bio || !data || len <= 0) return -1;
+
+  if (bio->kind == BioKind::Pair) {
+    if (!bio->pair) return -1;
+    auto* dst = bio->pair;
+    dst->data.insert(dst->data.end(), static_cast<const unsigned char*>(data),
+                     static_cast<const unsigned char*>(data) + len);
+    return len;
+  }
+
+  if (bio->kind == BioKind::Memory) {
+    bio->data.insert(bio->data.end(), static_cast<const unsigned char*>(data),
+                     static_cast<const unsigned char*>(data) + len);
+    return len;
+  }
+
+  if (bio->kind == BioKind::Socket && bio->fd >= 0) {
+#ifdef _WIN32
+    return send(bio->fd, static_cast<const char*>(data), len, 0);
+#else
+    return static_cast<int>(send(bio->fd, data, static_cast<size_t>(len), 0));
+#endif
+  }
+
+  return -1;
+}
+
+size_t BIO_ctrl_pending(BIO* bio) { return bio_pending_bytes(bio); }
+
+size_t BIO_wpending(BIO* bio) { return bio_pending_bytes(bio); }
 
 long BIO_get_mem_data(BIO* bio, char** pp) {
   if (!bio || bio->kind != BioKind::Memory) {
@@ -817,13 +947,16 @@ long BIO_get_mem_data(BIO* bio, char** pp) {
   if (pp) {
     *pp = reinterpret_cast<char*>(bio->data.data() + bio->offset);
   }
-  return static_cast<long>(bio->data.size() - bio->offset);
+  return static_cast<long>(bio_pending_bytes(bio));
 }
 
 int BIO_free(BIO* a) {
   if (!a) return 0;
   if (a->kind == BioKind::Socket && a->close_on_free && a->fd >= 0) {
     close_socket_fd(a->fd);
+  }
+  if (a->kind == BioKind::Pair && a->pair) {
+    a->pair->pair = nullptr;
   }
   delete a;
   return 1;
@@ -868,6 +1001,46 @@ int EVP_DigestFinal_ex(EVP_MD_CTX* ctx, unsigned char* md, unsigned int* s) {
 const EVP_MD* EVP_md5(void) { return &g_md5; }
 const EVP_MD* EVP_sha256(void) { return &g_sha256; }
 const EVP_MD* EVP_sha512(void) { return &g_sha512; }
+
+EVP_PKEY* d2i_PrivateKey_bio(BIO* bp, EVP_PKEY** a) {
+  if (!bp) return nullptr;
+  char* p = nullptr;
+  long n = BIO_get_mem_data(bp, &p);
+  if (!p || n <= 0) return nullptr;
+
+  auto* pkey = new EVP_PKEY();
+#if MBEDTLS_VERSION_MAJOR >= 3
+  int rc = mbedtls_pk_parse_key(&pkey->pk,
+                                reinterpret_cast<const unsigned char*>(p),
+                                static_cast<size_t>(n),
+                                nullptr,
+                                0,
+                                mbedtls_ctr_drbg_random,
+                                nullptr);
+#else
+  int rc = mbedtls_pk_parse_key(&pkey->pk,
+                                reinterpret_cast<const unsigned char*>(p),
+                                static_cast<size_t>(n),
+                                nullptr,
+                                0);
+#endif
+  if (rc != 0) {
+    delete pkey;
+    return nullptr;
+  }
+
+  pkey->has_key = true;
+  if (a) *a = pkey;
+  return pkey;
+}
+
+int EVP_PKEY_is_a(const EVP_PKEY* pkey, const char* name) {
+  if (!pkey || !name) return 0;
+  if (std::strcmp(name, "RSA") == 0) {
+    return mbedtls_pk_get_type(&pkey->pk) == MBEDTLS_PK_RSA ? 1 : 0;
+  }
+  return 0;
+}
 
 void EVP_PKEY_free(EVP_PKEY* pkey) { delete pkey; }
 
@@ -1313,6 +1486,30 @@ EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bp, EVP_PKEY** x, void* /*cb*/, void* u) 
   return pkey;
 }
 
+RSA* PEM_read_bio_RSAPrivateKey(BIO* bp, RSA** x, pem_password_cb* cb, void* u) {
+  (void)bp;
+  (void)cb;
+  (void)u;
+  if (x) *x = nullptr;
+  set_error_message("PEM_read_bio_RSAPrivateKey is not implemented by native-tls-shim",
+                    ERR_R_PEM_LIB, ERR_LIB_PEM);
+  return nullptr;
+}
+
+EVP_PKEY* PEM_read_bio_Parameters(BIO* bp, EVP_PKEY** x) {
+  return PEM_read_bio_PrivateKey(bp, x, nullptr, nullptr);
+}
+
+DH* PEM_read_bio_DHparams(BIO* bp, DH** x, pem_password_cb* cb, void* u) {
+  (void)bp;
+  (void)cb;
+  (void)u;
+  if (x) *x = nullptr;
+  set_error_message("PEM_read_bio_DHparams is not implemented by native-tls-shim",
+                    ERR_R_PEM_LIB, ERR_LIB_PEM);
+  return nullptr;
+}
+
 int PEM_write_bio_X509(BIO* bp, X509* x) {
   if (!bp || !x || bp->kind != BioKind::Memory || !x->crt.raw.p) return 0;
   std::array<unsigned char, 8192> out{};
@@ -1363,8 +1560,10 @@ STACK_OF_X509_INFO* PEM_X509_INFO_read_bio(BIO* bp, STACK_OF_X509_INFO* sk,
 }
 
 /* ===== SSL methods/context ===== */
+const SSL_METHOD* TLS_method(void) { return &g_any_method; }
 const SSL_METHOD* TLS_client_method(void) { return &g_client_method; }
 const SSL_METHOD* TLS_server_method(void) { return &g_server_method; }
+const SSL_METHOD* SSLv23_method(void) { return &g_any_method; }
 const SSL_METHOD* SSLv23_client_method(void) { return &g_client_method; }
 const SSL_METHOD* SSLv23_server_method(void) { return &g_server_method; }
 
@@ -1393,6 +1592,14 @@ void SSL_CTX_set_verify(SSL_CTX* ctx, int mode,
   apply_ctx_ca_store(ctx);
 }
 
+int SSL_CTX_get_verify_mode(const SSL_CTX* ctx) {
+  return ctx ? ctx->verify_mode : SSL_VERIFY_NONE;
+}
+
+int (*SSL_CTX_get_verify_callback(const SSL_CTX* ctx))(int, X509_STORE_CTX*) {
+  return ctx ? ctx->verify_callback : nullptr;
+}
+
 void SSL_CTX_set_verify_depth(SSL_CTX* ctx, int depth) {
   if (ctx) ctx->verify_depth = depth;
 }
@@ -1412,6 +1619,12 @@ long SSL_CTX_clear_mode(SSL_CTX* ctx, long mode) {
 long SSL_CTX_set_options(SSL_CTX* ctx, long options) {
   if (!ctx) return 0;
   ctx->options |= options;
+  return ctx->options;
+}
+
+long SSL_CTX_clear_options(SSL_CTX* ctx, long options) {
+  if (!ctx) return 0;
+  ctx->options &= ~options;
   return ctx->options;
 }
 
@@ -1649,6 +1862,48 @@ int SSL_CTX_use_PrivateKey(SSL_CTX* ctx, EVP_PKEY* pkey) {
   return apply_ctx_own_cert(ctx) ? 1 : 0;
 }
 
+int SSL_CTX_use_certificate_ASN1(SSL_CTX* ctx, int len, const unsigned char* d) {
+  if (!ctx || !d || len <= 0) return 0;
+  mbedtls_x509_crt_free(&ctx->own_cert_chain);
+  mbedtls_x509_crt_init(&ctx->own_cert_chain);
+  int rc = mbedtls_x509_crt_parse_der(&ctx->own_cert_chain, d, static_cast<size_t>(len));
+  if (rc != 0) return 0;
+  ctx->own_cert_loaded = true;
+  return apply_ctx_own_cert(ctx) ? 1 : 0;
+}
+
+int SSL_CTX_use_PrivateKey_ASN1(int /*pk*/, SSL_CTX* ctx, const unsigned char* d, long len) {
+  if (!ctx || !d || len <= 0) return 0;
+  mbedtls_pk_free(&ctx->own_key);
+  mbedtls_pk_init(&ctx->own_key);
+#if MBEDTLS_VERSION_MAJOR >= 3
+  int rc = mbedtls_pk_parse_key(&ctx->own_key, d, static_cast<size_t>(len), nullptr, 0,
+                                mbedtls_ctr_drbg_random, &ctx->ctr_drbg);
+#else
+  int rc = mbedtls_pk_parse_key(&ctx->own_key, d, static_cast<size_t>(len), nullptr, 0);
+#endif
+  if (rc != 0) return 0;
+  ctx->own_key_loaded = true;
+  return apply_ctx_own_cert(ctx) ? 1 : 0;
+}
+
+// NOTE: native-tls-shim does not implement legacy low-level RSA/DH key APIs.
+// For SSL_CTX_use_* style functions, OpenSSL uses 1=success and 0=failure,
+// so unsupported entry points below return 0 and set ERR_* details.
+int SSL_CTX_use_RSAPrivateKey(SSL_CTX* /*ctx*/, RSA* /*rsa*/) {
+  set_error_message("SSL_CTX_use_RSAPrivateKey is not implemented by native-tls-shim",
+                    1, ERR_LIB_SSL);
+  return 0;
+}
+
+int SSL_CTX_use_RSAPrivateKey_ASN1(SSL_CTX* ctx, const unsigned char* d, long len) {
+  return SSL_CTX_use_PrivateKey_ASN1(0, ctx, d, len);
+}
+
+int SSL_CTX_use_RSAPrivateKey_file(SSL_CTX* ctx, const char* file, int type) {
+  return SSL_CTX_use_PrivateKey_file(ctx, file, type);
+}
+
 int SSL_CTX_check_private_key(const SSL_CTX* ctx) {
   if (!ctx || !ctx->own_cert_loaded || !ctx->own_key_loaded) return 0;
 #if MBEDTLS_VERSION_MAJOR >= 3
@@ -1662,8 +1917,20 @@ int SSL_CTX_check_private_key(const SSL_CTX* ctx) {
 #endif
 }
 
+void SSL_CTX_set_default_passwd_cb(SSL_CTX* ctx, pem_password_cb* cb) {
+  if (ctx) ctx->passwd_cb = cb;
+}
+
+pem_password_cb* SSL_CTX_get_default_passwd_cb(SSL_CTX* ctx) {
+  return ctx ? ctx->passwd_cb : nullptr;
+}
+
 void SSL_CTX_set_default_passwd_cb_userdata(SSL_CTX* ctx, void* u) {
   if (ctx) ctx->passwd_userdata = u;
+}
+
+void* SSL_CTX_get_default_passwd_cb_userdata(SSL_CTX* ctx) {
+  return ctx ? ctx->passwd_userdata : nullptr;
 }
 
 X509_STORE* SSL_CTX_get_cert_store(const SSL_CTX* ctx) {
@@ -1684,12 +1951,33 @@ void SSL_CTX_set_client_CA_list(SSL_CTX* ctx, STACK_OF_X509_NAME* list) {
   ctx->client_ca_list = list;
 }
 
+int SSL_CTX_add_extra_chain_cert(SSL_CTX* /*ctx*/, X509* x509) {
+  if (x509) X509_free(x509);
+  return 1;
+}
+
+void SSL_CTX_clear_chain_certs(SSL_CTX* /*ctx*/) {}
+
+int SSL_CTX_set0_tmp_dh_pkey(SSL_CTX* /*ctx*/, EVP_PKEY* pkey) {
+  if (pkey) EVP_PKEY_free(pkey);
+  set_error_message("SSL_CTX_set0_tmp_dh_pkey is not implemented by native-tls-shim",
+                    1, ERR_LIB_SSL);
+  return 0;
+}
+
+int SSL_CTX_set_tmp_dh(SSL_CTX* /*ctx*/, DH* /*dh*/) {
+  set_error_message("SSL_CTX_set_tmp_dh is not implemented by native-tls-shim",
+                    1, ERR_LIB_SSL);
+  return 0;
+}
+
 int SSL_CTX_set_min_proto_version(SSL_CTX* ctx, int version) {
   if (!ctx) return 0;
   ctx->min_proto_version = version;
 
   mbedtls_ssl_protocol_version v = MBEDTLS_SSL_VERSION_TLS1_2;
   switch (version) {
+    case SSL3_VERSION:
     case TLS1_VERSION:
     case TLS1_1_VERSION:
     case TLS1_2_VERSION:
@@ -1709,6 +1997,32 @@ int SSL_CTX_set_min_proto_version(SSL_CTX* ctx, int version) {
   return 1;
 }
 
+int SSL_CTX_set_max_proto_version(SSL_CTX* ctx, int version) {
+  if (!ctx) return 0;
+  ctx->max_proto_version = version;
+
+  mbedtls_ssl_protocol_version v = MBEDTLS_SSL_VERSION_TLS1_2;
+  switch (version) {
+    case SSL3_VERSION:
+    case TLS1_VERSION:
+    case TLS1_1_VERSION:
+    case TLS1_2_VERSION:
+      v = MBEDTLS_SSL_VERSION_TLS1_2;
+      break;
+#ifdef MBEDTLS_SSL_VERSION_TLS1_3
+    case TLS1_3_VERSION:
+      v = MBEDTLS_SSL_VERSION_TLS1_3;
+      break;
+#endif
+    default:
+      v = MBEDTLS_SSL_VERSION_TLS1_2;
+      break;
+  }
+
+  mbedtls_ssl_conf_max_tls_version(&ctx->conf, v);
+  return 1;
+}
+
 int SSL_CTX_set_alpn_protos(SSL_CTX* ctx, const unsigned char* protos, unsigned int len) {
   if (!ctx || !protos || len == 0) return 1;
   parse_alpn_blob(ctx, protos, len);
@@ -1721,7 +2035,9 @@ SSL* SSL_new(SSL_CTX* ctx) {
   auto* ssl = new SSL();
   ssl->ctx = ctx;
   ssl->verify_mode = ctx->verify_mode;
+  ssl->verify_depth = ctx->verify_depth;
   ssl->verify_callback = ctx->verify_callback;
+  ssl->mode = ctx->mode;
   if (!setup_ssl_instance(ssl)) {
     delete ssl;
     return nullptr;
@@ -1750,12 +2066,19 @@ void SSL_set_bio(SSL* ssl, BIO* rbio, BIO* wbio) {
     }
   }
   ssl->rbio = rbio;
-  ssl->wbio = wbio;
+  ssl->wbio = wbio ? wbio : rbio;
 
-  if (rbio && rbio->kind == BioKind::Socket) {
-    ssl->fd = rbio->fd;
-    if (ssl->ssl_setup)
+  if (ssl->rbio && ssl->rbio->kind == BioKind::Socket) {
+    ssl->fd = ssl->rbio->fd;
+    if (ssl->ssl_setup) {
       mbedtls_ssl_set_bio(&ssl->ssl, &ssl->fd, ssl_send_cb, ssl_recv_cb, nullptr);
+    }
+    return;
+  }
+
+  ssl->fd = -1;
+  if (ssl->ssl_setup && (ssl->rbio || ssl->wbio)) {
+    mbedtls_ssl_set_bio(&ssl->ssl, ssl, ssl_send_bio_cb, ssl_recv_bio_cb, nullptr);
   }
 }
 
@@ -1800,6 +2123,24 @@ void SSL_set_verify(SSL* ssl, int mode,
   }
 }
 
+int SSL_get_verify_mode(const SSL* ssl) {
+  return ssl ? ssl->verify_mode : SSL_VERIFY_NONE;
+}
+
+int (*SSL_get_verify_callback(const SSL* ssl))(int, X509_STORE_CTX*) {
+  return ssl ? ssl->verify_callback : nullptr;
+}
+
+void SSL_set_verify_depth(SSL* ssl, int depth) {
+  if (ssl) ssl->verify_depth = depth;
+}
+
+long SSL_set_mode(SSL* ssl, long mode) {
+  if (!ssl) return 0;
+  ssl->mode |= mode;
+  return ssl->mode;
+}
+
 int SSL_set_ecdh_auto(SSL* /*ssl*/, int /*onoff*/) { return 1; }
 
 int SSL_connect(SSL* ssl) {
@@ -1822,10 +2163,7 @@ int SSL_connect(SSL* ssl) {
 
   ssl->ignore_verify_result = false;
 
-  int ret = 0;
-  do {
-    ret = mbedtls_ssl_handshake(&ssl->ssl);
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+  int ret = mbedtls_ssl_handshake(&ssl->ssl);
 
   if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
     uint32_t flags = mbedtls_ssl_get_verify_result(&ssl->ssl);
@@ -1848,6 +2186,8 @@ int SSL_connect(SSL* ssl) {
   ssl->last_error = map_mbedtls_to_ssl_error(ret);
 
   if (ret == 0) {
+    ssl->last_ret = 1;
+    ssl->last_error = SSL_ERROR_NONE;
     if (!run_verify_callback_if_any(ssl)) {
       ssl->last_error = SSL_ERROR_SSL;
       set_error_message("verify callback rejected certificate");
@@ -1879,15 +2219,14 @@ int SSL_accept(SSL* ssl) {
 
   ssl->ignore_verify_result = false;
 
-  int ret = 0;
-  do {
-    ret = mbedtls_ssl_handshake(&ssl->ssl);
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+  int ret = mbedtls_ssl_handshake(&ssl->ssl);
 
   ssl->last_ret = ret;
   ssl->last_error = map_mbedtls_to_ssl_error(ret);
 
   if (ret == 0) {
+    ssl->last_ret = 1;
+    ssl->last_error = SSL_ERROR_NONE;
     if (!run_verify_callback_if_any(ssl)) {
       ssl->last_error = SSL_ERROR_SSL;
       set_error_message("verify callback rejected peer certificate");
@@ -1919,6 +2258,10 @@ int SSL_read(SSL* ssl, void* buf, int num) {
   int ret = mbedtls_ssl_read(&ssl->ssl, static_cast<unsigned char*>(buf), static_cast<size_t>(num));
   ssl->last_ret = ret;
   ssl->last_error = map_mbedtls_to_ssl_error(ret);
+  if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0) {
+    ssl->shutdown_state |= SSL_RECEIVED_SHUTDOWN;
+    ssl->last_error = SSL_ERROR_ZERO_RETURN;
+  }
   if (ret < 0 && ssl->last_error == SSL_ERROR_SSL) {
     char err[256] = {0};
     mbedtls_strerror(ret, err, sizeof(err));
@@ -1970,12 +2313,29 @@ int SSL_shutdown(SSL* ssl) {
   int ret = mbedtls_ssl_close_notify(&ssl->ssl);
   ssl->last_ret = ret;
   ssl->last_error = map_mbedtls_to_ssl_error(ret);
-  return ret == 0 ? 1 : 0;
+  if (ret == 0) {
+    ssl->shutdown_state |= SSL_SENT_SHUTDOWN;
+    ssl->last_ret = 1;
+    ssl->last_error = SSL_ERROR_NONE;
+    return 1;
+  }
+  if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+    return 0;
+  }
+  return -1;
 }
 
 int SSL_get_error(const SSL* ssl, int /*ret*/) {
   if (!ssl) return SSL_ERROR_SSL;
   return ssl->last_error;
+}
+
+int SSL_get_shutdown(const SSL* ssl) {
+  return ssl ? ssl->shutdown_state : 0;
+}
+
+SSL_CTX* SSL_get_SSL_CTX(const SSL* ssl) {
+  return ssl ? ssl->ctx : nullptr;
 }
 
 X509* SSL_get_peer_certificate(const SSL* ssl) {
@@ -2020,8 +2380,8 @@ void SSL_get0_alpn_selected(const SSL* ssl, const unsigned char** data, unsigned
 }
 
 void SSL_clear_mode(SSL* ssl, long mode) {
-  if (!ssl || !ssl->ctx) return;
-  ssl->ctx->mode &= ~mode;
+  if (!ssl) return;
+  ssl->mode &= ~mode;
 }
 
 STACK_OF_X509_NAME* SSL_load_client_CA_file(const char* file) {
