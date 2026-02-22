@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -51,6 +52,10 @@ def run():
     parser.add_argument("--source-dir", required=True)
     parser.add_argument("--port", type=int, default=9471)
     parser.add_argument("--client-bin", required=True)
+    parser.add_argument("--cmake-generator", required=True)
+    parser.add_argument("--cmake-generator-platform", nargs="?", default="", const="")
+    parser.add_argument("--cmake-generator-toolset", nargs="?", default="", const="")
+    parser.add_argument("--multi-config", choices=["0", "1"], required=True)
     parser.add_argument("--config", default="")
     args = parser.parse_args()
 
@@ -61,21 +66,42 @@ def run():
     server_build = build_dir / "tls13_server"
     venv_dir = server_build / ".venv"
 
-    config = args.config or os.environ.get("CTEST_CONFIGURATION_TYPE", "")
+    is_multi_config = args.multi_config == "1"
+    config = (args.config or os.environ.get("CTEST_CONFIGURATION_TYPE", "")) if is_multi_config else ""
     build_config = config
 
+    cache_file = server_build / "CMakeCache.txt"
+    if cache_file.exists():
+        cache_text = cache_file.read_text(encoding="utf-8", errors="ignore")
+        marker = "CMAKE_GENERATOR:INTERNAL="
+        idx = cache_text.find(marker)
+        if idx != -1:
+            line_end = cache_text.find("\n", idx)
+            cached_gen = cache_text[idx + len(marker): line_end if line_end != -1 else None].strip()
+            if cached_gen and cached_gen != args.cmake_generator:
+                shutil.rmtree(server_build, ignore_errors=True)
+
     python_exe = ensure_venv(venv_dir)
+
     cmake_config = [
         "cmake",
         "-S",
         str(server_source),
         "-B",
         str(server_build),
+        "-G",
+        args.cmake_generator,
         f"-DPython3_EXECUTABLE={python_exe}",
         "-DCMAKE_BUILD_TYPE=Debug",
     ]
+    if args.cmake_generator_platform:
+        cmake_config += ["-A", args.cmake_generator_platform]
+    if args.cmake_generator_toolset:
+        cmake_config += ["-T", args.cmake_generator_toolset]
     cmake_build = ["cmake", "--build", str(server_build), "--parallel"]
-    if config:
+    if is_multi_config:
+        if not build_config:
+            raise RuntimeError("--config is required for multi-config builds")
         cmake_build += ["--config", build_config]
 
     subprocess.check_call(cmake_config)

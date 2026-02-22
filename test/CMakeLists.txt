@@ -161,12 +161,28 @@ if(NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "MBEDTLS" AND EXISTS "${_asio_incl
   set_tests_properties(test_asio_https_roundtrip PROPERTIES TIMEOUT 60)
 endif()
 if(NOT NATIVE_TLS_SHIM_EFFECTIVE_BACKEND STREQUAL "SCHANNEL")
-  add_test(NAME test_tls13_only
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tls13_only_test.py
-      --build-dir ${CMAKE_BINARY_DIR}
-      --source-dir ${CMAKE_SOURCE_DIR}
-      --client-bin $<TARGET_FILE:test_tls13_only_client>
-      --config $<CONFIG>)
+  if(CMAKE_CONFIGURATION_TYPES)
+    add_test(NAME test_tls13_only
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tls13_only_test.py
+        --build-dir ${CMAKE_BINARY_DIR}
+        --source-dir ${CMAKE_SOURCE_DIR}
+        --client-bin $<TARGET_FILE:test_tls13_only_client>
+        --cmake-generator ${CMAKE_GENERATOR}
+        --cmake-generator-platform ${CMAKE_GENERATOR_PLATFORM}
+        --cmake-generator-toolset ${CMAKE_GENERATOR_TOOLSET}
+        --multi-config 1
+        --config $<CONFIG>)
+  else()
+    add_test(NAME test_tls13_only
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tls13_only_test.py
+        --build-dir ${CMAKE_BINARY_DIR}
+        --source-dir ${CMAKE_SOURCE_DIR}
+        --client-bin $<TARGET_FILE:test_tls13_only_client>
+        --cmake-generator ${CMAKE_GENERATOR}
+        --cmake-generator-platform ${CMAKE_GENERATOR_PLATFORM}
+        --cmake-generator-toolset ${CMAKE_GENERATOR_TOOLSET}
+        --multi-config 0)
+  endif()
   set_tests_properties(test_tls13_only PROPERTIES TIMEOUT 120)
 endif()
 
