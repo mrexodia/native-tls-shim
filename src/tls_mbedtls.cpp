@@ -61,17 +61,18 @@
 #include <unistd.h>
 #endif
 
-constexpr unsigned long make_error_code(int lib, int reason) {
-  return (static_cast<unsigned long>(lib & 0xFF) << 24) |
-         static_cast<unsigned long>(reason & 0xFFFFFF);
-}
-
 inline void set_error_message(const std::string& msg, int reason = 1,
                               int lib = ERR_LIB_X509) {
-  native_tls::set_last_error(make_error_code(lib, reason), msg);
+  native_tls::set_error_message(msg, reason, lib);
 }
 
-inline void clear_error_message() { native_tls::set_last_error(0, {}); }
+inline void clear_error_message() { native_tls::clear_error_message(); }
+
+using native_tls::extract_dn_component;
+using native_tls::is_ip_literal;
+using native_tls::set_fd_nonblocking;
+using native_tls::trim;
+using native_tls::wildcard_match;
 
 #ifdef _WIN32
 using socket_len_t = int;
@@ -87,61 +88,12 @@ int close_socket_fd(int fd) {
 #endif
 }
 
-bool set_fd_nonblocking(int fd, bool on) {
-#ifdef _WIN32
-  u_long mode = on ? 1 : 0;
-  return ioctlsocket(fd, FIONBIO, &mode) == 0;
-#else
-  int flags = fcntl(fd, F_GETFL, 0);
-  if (flags < 0) return false;
-  if (on)
-    flags |= O_NONBLOCK;
-  else
-    flags &= ~O_NONBLOCK;
-  return fcntl(fd, F_SETFL, flags) == 0;
-#endif
-}
-
 time_t timegm_utc(std::tm* tmv) {
 #ifdef _WIN32
   return _mkgmtime(tmv);
 #else
   return timegm(tmv);
 #endif
-}
-
-std::string trim(std::string s) {
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
-    s.erase(s.begin());
-  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
-    s.pop_back();
-  return s;
-}
-
-std::string extract_dn_component(const std::string& dn, const std::string& key) {
-  auto pattern = key + "=";
-  auto pos = dn.find(pattern);
-  if (pos == std::string::npos) return {};
-  pos += pattern.size();
-  auto end = dn.find(',', pos);
-  if (end == std::string::npos) end = dn.size();
-  return trim(dn.substr(pos, end - pos));
-}
-
-bool wildcard_match(const std::string& pattern, const std::string& host) {
-  if (pattern == host) return true;
-
-  if (pattern.size() < 3 || pattern[0] != '*' || pattern[1] != '.') return false;
-  if (pattern.find('*', 1) != std::string::npos) return false;
-
-  std::string suffix = pattern.substr(1); // ".example.com"
-  if (host.size() <= suffix.size()) return false;
-  if (host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
-
-  std::string left = host.substr(0, host.size() - suffix.size());
-  if (left.empty() || left.find('.') != std::string::npos) return false;
-
-  return true;
 }
 
 int map_mbedtls_to_ssl_error(int ret) {
@@ -155,18 +107,6 @@ int map_mbedtls_to_ssl_error(int ret) {
 
 struct ssl_method_st {
   int endpoint;
-};
-
-struct asn1_string_st {
-  std::vector<unsigned char> bytes;
-};
-
-struct asn1_time_st {
-  time_t epoch = 0;
-};
-
-struct bignum_st {
-  std::vector<unsigned char> bytes;
 };
 
 struct x509_name_st {
@@ -740,12 +680,6 @@ bool cert_matches_hostname(const X509* cert, const std::string& host, bool check
   return false;
 }
 
-bool is_ip_literal(const std::string& s) {
-  std::array<unsigned char, 16> buf{};
-  return inet_pton(AF_INET, s.c_str(), buf.data()) == 1 ||
-         inet_pton(AF_INET6, s.c_str(), buf.data()) == 1;
-}
-
 int run_verify_callback_if_any(SSL* ssl) {
   if (!ssl) return 1;
   auto* cb = ssl->verify_callback ? ssl->verify_callback : ssl->ctx->verify_callback;
@@ -1040,70 +974,6 @@ int EVP_PKEY_is_a(const EVP_PKEY* pkey, const char* name) {
 }
 
 void EVP_PKEY_free(EVP_PKEY* pkey) { delete pkey; }
-
-/* ===== ASN1 / BN ===== */
-const unsigned char* ASN1_STRING_get0_data(const ASN1_STRING* x) {
-  if (!x || x->bytes.empty()) return nullptr;
-  return x->bytes.data();
-}
-
-unsigned char* ASN1_STRING_data(ASN1_STRING* x) {
-  return const_cast<unsigned char*>(ASN1_STRING_get0_data(x));
-}
-
-int ASN1_STRING_length(const ASN1_STRING* x) {
-  if (!x) return 0;
-  return static_cast<int>(x->bytes.size());
-}
-
-ASN1_TIME* ASN1_TIME_new(void) { return new ASN1_TIME(); }
-
-void ASN1_TIME_free(ASN1_TIME* t) { delete t; }
-
-ASN1_TIME* ASN1_TIME_set(ASN1_TIME* s, time_t t) {
-  if (!s) s = ASN1_TIME_new();
-  if (s) s->epoch = t;
-  return s;
-}
-
-int ASN1_TIME_diff(int* pday, int* psec, const ASN1_TIME* from, const ASN1_TIME* to) {
-  if (!pday || !psec || !from || !to) return 0;
-  auto diff = static_cast<long long>(to->epoch) - static_cast<long long>(from->epoch);
-  *pday = static_cast<int>(diff / 86400);
-  *psec = static_cast<int>(diff % 86400);
-  return 1;
-}
-
-BIGNUM* ASN1_INTEGER_to_BN(const ASN1_INTEGER* ai, BIGNUM* bn) {
-  if (!ai) return nullptr;
-  if (!bn) bn = new BIGNUM();
-  if (!bn) return nullptr;
-  bn->bytes = ai->bytes;
-  return bn;
-}
-
-char* BN_bn2hex(const BIGNUM* a) {
-  if (!a) return nullptr;
-  static const char* hex = "0123456789ABCDEF";
-  if (a->bytes.empty()) {
-    char* z = static_cast<char*>(OPENSSL_malloc(2));
-    if (!z) return nullptr;
-    z[0] = '0';
-    z[1] = '\0';
-    return z;
-  }
-  size_t out_len = a->bytes.size() * 2;
-  char* out = static_cast<char*>(OPENSSL_malloc(out_len + 1));
-  if (!out) return nullptr;
-  for (size_t i = 0; i < a->bytes.size(); ++i) {
-    out[2 * i] = hex[(a->bytes[i] >> 4) & 0x0F];
-    out[2 * i + 1] = hex[a->bytes[i] & 0x0F];
-  }
-  out[out_len] = '\0';
-  return out;
-}
-
-void BN_free(BIGNUM* a) { delete a; }
 
 /* ===== X509 ===== */
 X509* d2i_X509(X509** px, const unsigned char** in, int len) {
